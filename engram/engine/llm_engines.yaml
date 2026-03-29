@@ -1,0 +1,122 @@
+engines:
+  # --- llama.cpp engines (CPU-only, split GPU+CPU, or full GPU via llama-server) ---
+  # Full CPU: suitable for machines without a GPU or when GPU is fully occupied.
+  llama_7b_cpu:
+    type: llama_cpp
+    model: llama_7b_cpu             # served alias (arbitrary)
+    gguf_path: /models/qwen2.5-7b-instruct-q4_k_m.gguf
+    base_url: http://127.0.0.1:8080/v1
+    max_context: 32768
+    n_gpu_layers: 0                 # 0 = full CPU; 999 = all GPU; N = split
+    timeout: 300                    # CPU inference is slower; generous timeout
+    system_prompt: You are a helpful AI assistant.
+    compression_strategy: compress
+    max_retries: 1
+    launch:
+      host: 127.0.0.1
+      port: 8080
+      extra_args:
+        - --threads
+        - "8"
+
+  # Split GPU+CPU: first N transformer layers on GPU, rest on CPU.
+  # Good for 32-35B models that exceed VRAM at full precision.
+  # RTX 3090 (24GB) + Q4_K_M: ~40 layers covers ~14GB, leaving headroom.
+  llama_32b_split:
+    type: llama_cpp
+    model: llama_32b_split
+    gguf_path: /models/qwen2.5-32b-instruct-q4_k_m.gguf
+    base_url: http://127.0.0.1:8081/v1
+    max_context: 16384
+    n_gpu_layers: 40                # tune based on VRAM: 40 ≈ 14GB on RTX 3090
+    timeout: 300
+    system_prompt: You are a helpful AI assistant.
+    compression_strategy: compress
+    max_retries: 1
+    launch:
+      host: 127.0.0.1
+      port: 8081
+
+  qwen_7b:
+    type: vllm
+    model: Qwen/Qwen2.5-7B-Instruct
+    base_url: http://localhost:8000/v1
+    timeout: 60
+    max_context: 32768
+    system_prompt: You are a helpful AI assistant.
+    compression_strategy: compress
+    max_retries: 1
+  qwen_32b:
+    type: vllm
+    model: qwen-32b-awq
+    base_url: http://localhost:8000/v1
+    timeout: 120
+    max_context: 8192
+    system_prompt: You are a helpful AI assistant with expertise in cybersecurity
+      and data science.
+    compression_strategy: compress
+    max_retries: 1
+  claude:
+    type: anthropic
+    model: claude-sonnet-4.5-20250929
+    timeout: 60
+    max_context: 200000
+    system_prompt: You are Claude, a helpful AI assistant.
+    compression_strategy: truncate_end
+    max_retries: 1
+  qwen3_8b:
+    type: ollama
+    model: qwen3:8b
+    base_url: http://localhost:11434/v1
+    timeout: 120
+    max_context: 32768
+    system_prompt: You are a helpful AI assistant.
+    compression_strategy: compress
+    max_retries: 1
+  qwen3_32b:
+    type: ollama
+    model: qwen3:32b
+    base_url: http://localhost:11434/v1
+    timeout: 300
+    max_context: 32768
+    num_gpu: 40
+    system_prompt: You are a helpful AI assistant.
+    compression_strategy: compress
+    max_retries: 1
+  openai_fallback:
+    type: openai
+    model: gpt-4.1-mini
+    base_url: https://api.openai.com/v1
+    api_key_env: ENGRAM_OPENAI_API_KEY
+    timeout: 60
+    max_context: 128000
+    system_prompt: You are a helpful AI assistant.
+    compression_strategy: truncate_end
+    max_retries: 1
+profiles:
+  default_local:
+    engines:
+    - qwen3_32b
+    - qwen3_8b
+    allow_cloud_failover: false
+    max_attempts: 4
+    circuit_breaker_failures: 3
+    circuit_breaker_cooldown_s: 30
+    telemetry:
+      enabled: false
+      sink: log   # log | jsonl
+      jsonl_path: ~/.engram/telemetry.jsonl
+  local_plus_cloud:
+    engines:
+    - qwen3_32b
+    - qwen3_8b
+    - openai_fallback
+    allow_cloud_failover: true
+    max_attempts: 4
+    cloud_policy: query_plus_summary
+    circuit_breaker_failures: 3
+    circuit_breaker_cooldown_s: 30
+    telemetry:
+      enabled: false
+      sink: log
+      jsonl_path: ~/.engram/telemetry.jsonl
