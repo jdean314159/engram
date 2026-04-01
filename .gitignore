@@ -20,3 +20,10 @@ __pycache__/
 dist/
 build/
 data/memory/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+data/memory/
