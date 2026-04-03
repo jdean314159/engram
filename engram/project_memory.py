@@ -743,9 +743,23 @@ class ProjectMemory:
         return self.embedding_service.embed(text)
 
     def run_lifecycle_maintenance(self):
-        """Run conservative cross-layer promotion + archival policies."""
+        """Run conservative cross-layer promotion + archival policies.
+
+        Includes neural consolidation: episodes repeatedly retrieved with high
+        neural affinity are promoted to semantic memory independently of their
+        importance score.
+        """
         started = time.perf_counter()
         report = self.lifecycle.run_maintenance()
+
+        # Neural consolidation: promote high-affinity episodes to semantic.
+        if self.neural_coord is not None and self.episodic is not None:
+            neural_report = self.lifecycle.run_neural_consolidation(
+                self.neural_coord, self.episodic)
+            report.promoted_events += neural_report.promoted_events
+            report.promoted_facts += neural_report.promoted_facts
+            report.details.extend(neural_report.details)
+
         self.telemetry.emit(
             "perf_span",
             "lifecycle maintenance completed",

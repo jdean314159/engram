@@ -65,6 +65,9 @@ class NeuralCoordinator:
         self._val_proj = value_projector
         self._emb = embedding_service
         self._pending_user_key = None  # buffered user embedding, waiting for assistant reply
+        # Per-episode affinity hit counter for consolidation.
+        # Incremented when a candidate is selected with neural_affinity above threshold.
+        self._affinity_hits: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Conversation feeding
@@ -286,29 +289,162 @@ class NeuralCoordinator:
     # Retrieval support
     # ------------------------------------------------------------------
 
-    def query_surprise(self, query: str) -> Optional[Dict]:
-        """Compute surprise for a retrieval query.
+    def query_neural_context(self, query: str) -> Optional[Dict]:
+        """Compute surprise and predicted value vector for a retrieval query.
 
-        Returns a dict with keys used by UnifiedRetriever to populate
-        ContextResult.neural_meta, or None if embedding fails.
+        Uses read() (non-mutating) to get the network's predicted response
+        embedding for the query, plus the surprise score.  Intended to be
+        called once per retrieve() call, before candidate scoring, so the
+        predicted vector can drive per-candidate affinity scoring.
+
+        Returns dict with keys:
+            predicted_value  np.ndarray (value_dim,) — network's prediction
+            query_surprise   float  — MSE between prediction and self-assoc target
+            avg_surprise     float  — running EMA baseline
+            surprise_ratio   float  — query_surprise / avg_surprise, clamped [0, 3]
+            total_steps      int
+            warmed_up        bool
+            write_ratio      float
+            memory_role      str
+            model_fingerprint str | None
+
+        Returns None if embedding fails.
         """
         embedding = self._emb.embed(query)
         if embedding is None:
             return None
 
         key = self._key_proj(embedding)
-        value = self._val_proj(embedding)
+        value = self._val_proj(embedding)  # self-association as surprise target
+
+        predicted_value = self._neural.read(key)   # non-mutating
         surprise = self._neural.surprise(key, value)
         stats = self._neural.get_stats()
+
+        avg_surprise = stats.get("avg_surprise", 0.0)
+        total_steps = stats.get("total_steps", 0)
+        warmed_up = total_steps >= _MIN_STEPS_FOR_HINT
+
+        surprise_ratio = 0.0
+        if warmed_up and avg_surprise > 1e-10:
+            surprise_ratio = min(surprise / avg_surprise, 3.0)
+
         return {
+            "predicted_value": predicted_value,
             "query_surprise": float(surprise),
-            "avg_surprise": stats.get("avg_surprise", 0.0),
-            "total_steps": stats.get("total_steps", 0),
+            "avg_surprise": avg_surprise,
+            "surprise_ratio": float(surprise_ratio),
+            "total_steps": total_steps,
+            "warmed_up": warmed_up,
             "write_ratio": stats.get("write_ratio", 0.0),
             "memory_role": stats.get("memory_role", "auxiliary_embedding_memory"),
             "backend_agnostic": stats.get("backend_agnostic", True),
             "model_fingerprint": stats.get("model_fingerprint"),
         }
+
+    def query_surprise(self, query: str) -> Optional[Dict]:
+        """Backward-compatible wrapper around query_neural_context.
+
+        Returns the same dict as before but delegates to query_neural_context
+        so that read() and surprise() share one embed call.  Callers that
+        already have a neural_ctx dict from query_neural_context should use
+        that directly instead of calling this method.
+        """
+        ctx = self.query_neural_context(query)
+        if ctx is None:
+            return None
+        # Strip predicted_value — it is not JSON-serialisable and wasn't
+        # part of the original contract.
+        return {k: v for k, v in ctx.items() if k != "predicted_value"}
+
+    def candidate_affinity(
+        self, predicted_value, candidate_text: str
+    ) -> float:
+        """Cosine similarity between the network's predicted response and a candidate.
+
+        Measures how closely a retrieved memory matches what the RTRL network
+        expects to be relevant for the current query.  Only meaningful when
+        the network is warmed up (is_warmed_up() is True).
+
+        Args:
+            predicted_value: Value vector from read(), shape (value_dim,).
+            candidate_text:  Text of the retrieval candidate to score.
+
+        Returns:
+            Cosine similarity in [-1, 1].  Returns 0.0 on embed failure or
+            degenerate vectors.
+        """
+        import numpy as np
+        try:
+            embedding = self._emb.embed(candidate_text)
+            if embedding is None:
+                return 0.0
+            candidate_value = self._val_proj(embedding)
+            pn = np.linalg.norm(predicted_value)
+            cn = np.linalg.norm(candidate_value)
+            if pn < 1e-10 or cn < 1e-10:
+                return 0.0
+            return float(np.dot(predicted_value, candidate_value) / (pn * cn))
+        except Exception:
+            logger.debug("candidate_affinity failed", exc_info=True)
+            return 0.0
+
+    # ------------------------------------------------------------------
+    # Neural consolidation (affinity-hit tracking → semantic promotion)
+    # ------------------------------------------------------------------
+
+    # Minimum cosine similarity for a retrieval event to count as a hit.
+    _AFFINITY_HIT_THRESHOLD: float = 0.15
+
+    def record_retrieval_affinities(self, candidates: list) -> None:
+        """Accumulate per-episode affinity hits from a retrieval selection.
+
+        Called by UnifiedRetriever after candidate selection.  Only episodic
+        candidates with neural_affinity above the threshold are counted —
+        this filters out low-signal or unwarmed-network retrievals.
+
+        Args:
+            candidates: List of RetrievalCandidate objects that were selected.
+        """
+        for cand in candidates:
+            if cand.layer != "episodic":
+                continue
+            affinity = float(cand.metadata.get("neural_affinity", 0.0))
+            if affinity < self._AFFINITY_HIT_THRESHOLD:
+                continue
+            ep_id = cand.source_id
+            if ep_id:
+                self._affinity_hits[ep_id] = self._affinity_hits.get(ep_id, 0) + 1
+                logger.debug(
+                    "NeuralCoordinator: affinity hit ep=%s affinity=%.3f hits=%d",
+                    ep_id, affinity, self._affinity_hits[ep_id],
+                )
+
+    def consolidation_candidates(self, min_hits: int = 2) -> List[str]:
+        """Return episode IDs that have accumulated enough affinity hits.
+
+        Episodes that have been repeatedly retrieved with high neural affinity
+        are stable, well-learned patterns — good candidates for promotion to
+        semantic memory.
+
+        The hit counts are cleared after this call so each episode is only
+        returned once.  The lifecycle layer's digest-based deduplication
+        prevents double-promotion if the same episode is nominated again.
+
+        Args:
+            min_hits: Minimum number of high-affinity retrievals required.
+
+        Returns:
+            List of episode source_ids meeting the threshold.
+        """
+        candidates = [
+            ep_id for ep_id, hits in self._affinity_hits.items()
+            if hits >= min_hits
+        ]
+        # Clear consumed hits; episodes below threshold remain for accumulation.
+        for ep_id in candidates:
+            del self._affinity_hits[ep_id]
+        return candidates
 
     # ------------------------------------------------------------------
     # Session management
@@ -318,8 +454,10 @@ class NeuralCoordinator:
         """Reset session state (pending key + neural hidden state).
 
         Preserves learned weights — only the in-context hidden state is cleared.
+        Affinity hit counts are also cleared so consolidation starts fresh.
         """
         self._pending_user_key = None
+        self._affinity_hits.clear()
         self._neural.reset()
 
     # ------------------------------------------------------------------

@@ -381,6 +381,55 @@ class ModernSubgroupedRTRL:
         self._plateau_wait = 0
 
     # ------------------------------------------------------------------
+    # State snapshot / restore (for non-mutating read and surprise)
+    # ------------------------------------------------------------------
+
+    def _clone_scalar_or_tensor(self, value):
+        if value is None:
+            return None
+        if isinstance(value, (int, float, bool, str)):
+            return value
+        if isinstance(value, np.generic):
+            return value.item()
+        return self.B.clone(value)
+
+    def _restore_state_value(self, value):
+        if value is None:
+            return None
+        if isinstance(value, list):
+            return self.B.from_numpy(np.array(value, dtype=getattr(np, self.config.dtype)))
+        return value
+
+    def _snapshot_recurrent_state(self) -> Dict[str, Any]:
+        """Capture minimal mutable state needed to make forward() non-mutating.
+
+        Only saves recurrent state (outputs, activations, p matrices, gate
+        state, ln_std).  Does NOT save optimizer or LR scheduler state —
+        those are unaffected by a bare forward() call.
+        """
+        state: Dict[str, Any] = {
+            'outputs':      self._clone_scalar_or_tensor(self.outputs),
+            'activations':  self._clone_scalar_or_tensor(self.activations),
+            'errors':       self._clone_scalar_or_tensor(self.errors),
+            'p_matrix':     self._clone_scalar_or_tensor(self.p_matrix),
+            'p_matrix_old': self._clone_scalar_or_tensor(self.p_matrix_old),
+        }
+        if self.config.gated:
+            state['gate_values']  = self._clone_scalar_or_tensor(self.gate_values)
+            state['prev_outputs'] = self._clone_scalar_or_tensor(self.prev_outputs)
+            state['candidate']    = self._clone_scalar_or_tensor(
+                getattr(self, 'candidate', None))
+        if self.config.layer_norm:
+            state['ln_std'] = self._clone_scalar_or_tensor(self.ln_std)
+        return state
+
+    def _restore_recurrent_state(self, state: Dict[str, Any]) -> None:
+        """Restore recurrent state saved by _snapshot_recurrent_state."""
+        for key, value in state.items():
+            if value is not None:
+                setattr(self, key, self._restore_state_value(value))
+
+    # ------------------------------------------------------------------
     # Activation functions and derivatives
     # ------------------------------------------------------------------
 
@@ -1068,7 +1117,10 @@ class TITANSMemory:
     # ------------------------------------------------------------------
 
     def read(self, query) -> np.ndarray:
-        """Retrieve value for a query key without updating memory.
+        """Retrieve value for a query key without mutating memory state.
+
+        Snapshots and restores all recurrent state so that a read() call
+        has no effect on subsequent step() or write() calls.
 
         Args:
             query: [key_dim] numpy array or backend tensor
@@ -1078,12 +1130,19 @@ class TITANSMemory:
         """
         if isinstance(query, np.ndarray):
             query = self.B.from_numpy(query)
-        self.net.forward(query)
-        oi = self.net.output_indices
-        return self.B.to_numpy(self.net.outputs[oi]).copy()
+        saved = self.net._snapshot_recurrent_state()
+        try:
+            self.net.forward(query)
+            oi = self.net.output_indices
+            return self.B.to_numpy(self.net.outputs[oi]).copy()
+        finally:
+            self.net._restore_recurrent_state(saved)
 
     def surprise(self, key, value) -> float:
-        """Compute surprise (MSE) for a key-value pair without updating.
+        """Compute surprise (MSE) for a key-value pair without mutating state.
+
+        Snapshots and restores all recurrent state so that a surprise() call
+        has no effect on subsequent step() or write() calls.
 
         Args:
             key: [key_dim] input vector
@@ -1097,12 +1156,15 @@ class TITANSMemory:
         if isinstance(value, np.ndarray):
             value = self.B.from_numpy(value)
 
-        # Forward pass
-        self.net.forward(key)
-        oi = self.net.output_indices
-        predicted = self.net.outputs[oi]
-        diff = value - predicted
-        return float(self.B.sum(diff ** 2)) / len(self.net.output_indices)
+        saved = self.net._snapshot_recurrent_state()
+        try:
+            self.net.forward(key)
+            oi = self.net.output_indices
+            predicted = self.net.outputs[oi]
+            diff = value - predicted
+            return float(self.B.sum(diff ** 2)) / len(self.net.output_indices)
+        finally:
+            self.net._restore_recurrent_state(saved)
 
     def write(self, key, value) -> Dict[str, float]:
         """Update memory with a key-value pair, gated by surprise.
@@ -1165,7 +1227,7 @@ class TITANSMemory:
                 self.net.update_weights(z)
 
             # Restore LR
-            if cfg.surprise_modulated_lr:
+            if cfg.surprise_modulated_lr and self._surprise_ema > 1e-10:
                 self.net._current_lr = saved_lr
 
             self.stats['total_writes'] += 1
@@ -1241,7 +1303,7 @@ class TITANSMemory:
             else:
                 self.net.update_weights(z)
 
-            if cfg.surprise_modulated_lr:
+            if cfg.surprise_modulated_lr and self._surprise_ema > 1e-10:
                 self.net._current_lr = saved_lr
 
             self.stats['total_writes'] += 1

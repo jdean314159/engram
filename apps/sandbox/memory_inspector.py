@@ -223,6 +223,8 @@ def _neural_snapshot(pm) -> Dict[str, Any]:
         "stats": {},
         "available_methods": [],
         "enabled": False,
+        "warmed_up": False,
+        "pending_consolidation_hits": 0,
     }
 
     if pm is None:
@@ -239,17 +241,31 @@ def _neural_snapshot(pm) -> Dict[str, Any]:
         stats = neural.get_stats()
         if isinstance(stats, dict):
             result["stats"] = stats
+            total_steps = stats.get("total_steps", 0)
+            warmed_up = total_steps >= 50  # _MIN_STEPS_FOR_HINT
+            result["warmed_up"] = warmed_up
             for key, label in (
-                ("embedding_dim", "Embedding dim"),
-                ("hidden_dim", "Hidden dim"),
-                ("memory_size", "Memory size"),
-                ("total_updates", "Total updates"),
-                ("trained", "Trained"),
+                ("total_steps", "Total steps"),
+                ("session_steps", "Session steps"),
+                ("write_ratio", "Write ratio"),
+                ("avg_surprise", "Avg surprise"),
+                ("params", "Parameters"),
             ):
                 if key in stats:
                     result["summary"][label] = stats[key]
+            result["summary"]["Warmed up"] = "yes" if warmed_up else f"no ({total_steps}/50)"
     except Exception:
         pass
+
+    # Pending consolidation hits from coordinator
+    neural_coord = getattr(pm, "neural_coord", None)
+    if neural_coord is not None:
+        try:
+            hit_count = sum(getattr(neural_coord, "_affinity_hits", {}).values())
+            result["pending_consolidation_hits"] = hit_count
+            result["summary"]["Pending consolidation"] = hit_count
+        except Exception:
+            pass
 
     return result
 
@@ -594,22 +610,52 @@ def _render_graph_tab(pm) -> None:
             st.json(snap["stats"])
 
 def _render_neural_tab(pm) -> None:
-    st.caption("Neural memory surfaces learned or latent state that complements explicit symbolic memory.")
+    st.caption(
+        "Neural memory (RTRL/TITANS) learns conversational patterns online. "
+        "After warmup it drives retrieval reranking via predicted response embeddings "
+        "and promotes stable associations to semantic memory via consolidation."
+    )
     snap = _neural_snapshot(pm)
 
     if not snap.get("enabled"):
         st.caption("Neural memory is not enabled for this project.")
         return
 
-    _render_summary_metrics("Neural summary", snap.get("summary", {}))
+    stats = snap.get("stats", {})
+    warmed_up = snap.get("warmed_up", False)
 
-    if snap.get("stats"):
-        st.json(snap["stats"])
+    # Top-level signal health metrics
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total steps", stats.get("total_steps", 0))
+    col2.metric("Session steps", stats.get("session_steps", 0))
+    col3.metric(
+        "Write ratio",
+        f"{stats.get('write_ratio', 0.0):.1%}",
+        help="Fraction of steps where surprise exceeded threshold and weights updated",
+    )
+    col4.metric(
+        "Avg surprise",
+        f"{stats.get('avg_surprise', 0.0):.4f}",
+        help="Running mean prediction error — the novelty baseline",
+    )
+
+    col5, col6 = st.columns(2)
+    col5.metric(
+        "Signal status",
+        "Warmed up ✓" if warmed_up else f"Warming up ({stats.get('total_steps', 0)}/50)",
+        help="Retrieval reranking and consolidation are active only after 50 steps",
+    )
+    col6.metric(
+        "Pending consolidation",
+        snap.get("pending_consolidation_hits", 0),
+        help="Episodes with repeated high neural affinity, queued for semantic promotion",
+    )
+
+    with st.expander("Full stats", expanded=False):
+        st.json(stats)
 
     with st.expander("Neural debug", expanded=False):
         st.write("Available neural methods:", snap.get("available_methods", []))
-
-   
 def _render_context_tab(session_state) -> None:
     st.caption("Assembled Context shows the actual memory content selected for the last prompt, grouped by memory tier.")
     snap = _context_snapshot(session_state)
@@ -734,6 +780,44 @@ def _render_maintenance_tab(pm) -> None:
                         st.error(str(exc))
     else:
         st.caption("Forgetting policy not available.")
+
+    st.divider()
+
+    # --- Neural consolidation (lifecycle maintenance) ---
+    st.markdown("**Neural consolidation** (episodic → semantic via affinity)")
+    st.caption(
+        "Promotes episodes that have been repeatedly retrieved with high neural affinity "
+        "to semantic memory. Runs automatically during lifecycle maintenance."
+    )
+    neural_coord = getattr(pm, "neural_coord", None) if pm is not None else None
+    if neural_coord is not None:
+        pending = sum(getattr(neural_coord, "_affinity_hits", {}).values())
+        st.metric("Pending affinity hits", pending,
+                  help="Accumulated high-affinity retrieval events queued for promotion")
+        if st.button("Run lifecycle maintenance (with consolidation)",
+                     key="lifecycle_maintenance_run"):
+            with st.spinner("Running lifecycle maintenance…"):
+                try:
+                    report = pm.run_lifecycle_maintenance()
+                    promoted_e = getattr(report, "promoted_events", 0)
+                    promoted_f = getattr(report, "promoted_facts", 0)
+                    archived = getattr(report, "archived_episodes", 0)
+                    parts = []
+                    if promoted_e or promoted_f:
+                        parts.append(f"Promoted {promoted_e} events, {promoted_f} facts")
+                    if archived:
+                        parts.append(f"archived {archived} episodes")
+                    if parts:
+                        st.success(". ".join(parts) + ".")
+                    else:
+                        st.info("Nothing to promote or archive.")
+                    with st.expander("Report details"):
+                        details = getattr(report, "details", [])
+                        st.json(details if details else {})
+                except Exception as exc:
+                    st.error(str(exc))
+    else:
+        st.caption("Neural coordinator not available — neural consolidation disabled.")
 
     st.divider()
 

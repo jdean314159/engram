@@ -171,6 +171,77 @@ class MemoryLifecycleManager:
 
         return report
 
+    def run_neural_consolidation(
+        self,
+        neural_coord: Any,
+        episodic: Any,
+    ) -> LifecycleReport:
+        """Promote episodes with repeated high neural affinity to semantic memory.
+
+        Episodes that have been retrieved multiple times with high cosine
+        similarity to the network's predicted response vector represent stable,
+        well-learned associations — the neural layer has implicitly consolidated
+        them.  This method makes that consolidation explicit by promoting those
+        episodes into semantic memory.
+
+        Intended to be called from ``run_lifecycle_maintenance()`` when both
+        the neural coordinator and semantic layer are available.
+
+        Args:
+            neural_coord: NeuralCoordinator with accumulated affinity hits.
+            episodic:     EpisodicMemory to fetch episode text from.
+
+        Returns:
+            LifecycleReport with promoted_events / promoted_facts counts.
+        """
+        report = LifecycleReport()
+        if self.project_memory.semantic is None:
+            return report
+
+        candidate_ids = neural_coord.consolidation_candidates(min_hits=2)
+        if not candidate_ids:
+            return report
+
+        logger.info(
+            "Neural consolidation: %d episode(s) nominated for semantic promotion",
+            len(candidate_ids),
+        )
+
+        try:
+            episodes = episodic.get_by_ids(candidate_ids)
+        except Exception as exc:
+            logger.warning("Neural consolidation: get_by_ids failed: %s", exc)
+            return report
+
+        for ep in episodes:
+            text = getattr(ep, "text", "") or ""
+            if not text.strip():
+                continue
+            # Use the episode's existing importance but floor at 0.7 so these
+            # reliably cross the semantic promotion threshold.
+            importance = max(float(getattr(ep, "importance", 0.6) or 0.6), 0.7)
+            result = self.promote_episode(
+                episode_id=getattr(ep, "id", None),
+                text=text,
+                importance=importance,
+                metadata={"source_layer": "neural_consolidation"},
+                source="neural_consolidation",
+            )
+            report.promoted_events += result["event"]
+            report.promoted_facts += result["fact"]
+            if result["event"] or result["fact"]:
+                report.details.append({
+                    "episode_id": getattr(ep, "id", None),
+                    "action": "neural_consolidation",
+                    **result,
+                })
+                logger.info(
+                    "Neural consolidation: promoted ep=%s event=%d fact=%d",
+                    getattr(ep, "id", None), result["event"], result["fact"],
+                )
+
+        return report
+
     @staticmethod
     def _summarize_text(text: str, max_words: int = 36) -> str:
         words = (text or "").split()

@@ -79,6 +79,7 @@ class RetrievalPolicy:
     semantic_prefetch_limit: int = 60
     include_graph_context: bool = True
     graph_sentence_limit: int = 6
+    neural_affinity_weight: float = 0.08  # Candidate boost from RTRL predicted value
 
 
 class UnifiedRetriever:
@@ -129,8 +130,18 @@ class UnifiedRetriever:
 
         query_terms = self._query_terms(query)
         candidates: List[RetrievalCandidate] = []
-        candidates.extend(self._episodic_candidates(query, query_terms, episodic_n))
-        candidates.extend(self._semantic_candidates(query, query_terms, semantic_n))
+
+        # Compute neural context before candidate scoring so the predicted
+        # value vector can contribute to per-candidate affinity scores.
+        neural_ctx = None
+        if self.project_memory.neural_coord is not None:
+            neural_ctx = self.project_memory.neural_coord.query_neural_context(query)
+            if neural_ctx is not None:
+                result.neural_meta = {k: v for k, v in neural_ctx.items()
+                                      if k != "predicted_value"}
+
+        candidates.extend(self._episodic_candidates(query, query_terms, episodic_n, neural_ctx))
+        candidates.extend(self._semantic_candidates(query, query_terms, semantic_n, neural_ctx))
 
         if cold_fallback and self._needs_cold_fallback(candidates, budget, cold_min_fill_ratio):
             self.project_memory.telemetry.emit(
@@ -145,6 +156,11 @@ class UnifiedRetriever:
 
         selected = self._select_candidates(candidates, budget - result.working_tokens)
 
+        # Record neural affinity hits for consolidation tracking.
+        if (neural_ctx is not None and neural_ctx.get("warmed_up")
+                and self.project_memory.neural_coord is not None):
+            self.project_memory.neural_coord.record_retrieval_affinities(selected)
+
         for cand in selected:
             if cand.layer == "episodic":
                 result.episodic.append(cand.payload)
@@ -156,14 +172,10 @@ class UnifiedRetriever:
                 result.cold.append(cand.payload)
                 result.cold_tokens += cand.token_count
 
-        if query and self.project_memory.neural_coord is not None:
-            meta = self.project_memory.neural_coord.query_surprise(query)
-            if meta is not None:
-                result.neural_meta = meta
-
         return result
 
-    def _episodic_candidates(self, query: str, query_terms: Set[str], n: int) -> List[RetrievalCandidate]:
+    def _episodic_candidates(self, query: str, query_terms: Set[str], n: int,
+                             neural_ctx: Optional[Dict] = None) -> List[RetrievalCandidate]:
         # Expand the embedding query with synonyms before sending to ChromaDB.
         # ChromaDB embeds the query string via sentence-transformers; feeding it a
         # richer string that includes domain synonyms improves cosine similarity
@@ -191,11 +203,18 @@ class UnifiedRetriever:
             lexical = self._lexical_overlap_terms(query_terms, text)
             density = self._term_density(query_terms, text)
 
+            neural_affinity = 0.0
+            if (neural_ctx is not None and neural_ctx.get("warmed_up")
+                    and self.project_memory.neural_coord is not None):
+                neural_affinity = self.project_memory.neural_coord.candidate_affinity(
+                    neural_ctx["predicted_value"], text)
+
             score = (
                 self.policy.episodic_weight_lexical * lexical
                 + self.policy.episodic_weight_importance * importance
                 + self.policy.episodic_weight_recency * recency
                 + self.policy.episodic_weight_density * density
+                + self.policy.neural_affinity_weight * max(0.0, neural_affinity)
                 - rank * 0.02
             )
             out.append(
@@ -207,12 +226,14 @@ class UnifiedRetriever:
                     score=score,
                     source_id=getattr(ep, "id", None),
                     metadata={"importance": importance, "recency": recency,
-                              "lexical": lexical, "density": density},
+                              "lexical": lexical, "density": density,
+                              "neural_affinity": neural_affinity},
                 )
             )
         return out
 
-    def _semantic_candidates(self, query: str, query_terms: Set[str], n: int) -> List[RetrievalCandidate]:
+    def _semantic_candidates(self, query: str, query_terms: Set[str], n: int,
+                             neural_ctx: Optional[Dict] = None) -> List[RetrievalCandidate]:
         semantic = getattr(self.project_memory, "semantic", None)
         if semantic is None:
             return []
@@ -234,11 +255,19 @@ class UnifiedRetriever:
             timestamp = float(row.get("timestamp", now) or now)
             recency = max(0.0, 1.0 - min(max(0.0, now - timestamp) / (180.0 * 86400.0), 1.0))
             density = self._term_density(query_terms, text)
+
+            neural_affinity = 0.0
+            if (neural_ctx is not None and neural_ctx.get("warmed_up")
+                    and self.project_memory.neural_coord is not None):
+                neural_affinity = self.project_memory.neural_coord.candidate_affinity(
+                    neural_ctx["predicted_value"], text)
+
             score = (
                 self.policy.semantic_weight_lexical * lexical
                 + self.policy.semantic_weight_quality * quality
                 + self.policy.semantic_weight_recency * recency
                 + self.policy.semantic_weight_density * density
+                + self.policy.neural_affinity_weight * max(0.0, neural_affinity)
             )
 
             if row_type == "preference":
@@ -263,7 +292,7 @@ class UnifiedRetriever:
                     token_count=max(1, self.project_memory._token_counter(text)),
                     score=score,
                     source_id=str(row.get("id", "")),
-                    metadata={"quality": quality, "lexical": lexical, "density": density, "recency": recency, "type": row_type},
+                    metadata={"quality": quality, "lexical": lexical, "density": density, "recency": recency, "type": row_type, "neural_affinity": neural_affinity},
                 )
             )
 

@@ -354,3 +354,340 @@ def test_extractor_deduplication():
     # Second pass must not add more Entity nodes than the first pass
     # (dedup by id — existing nodes are updated, not duplicated)
     assert second <= first
+
+
+# ── Non-mutating read() and surprise() ────────────────────────────────────────
+
+def _to_np(B, tensor):
+    """Convert backend tensor to numpy regardless of backend."""
+    return B.to_numpy(tensor).copy()
+
+
+@test_group("Neural Memory")
+def test_titans_read_is_non_mutating():
+    """read() must not alter recurrent state: outputs, p_matrix, gate_values."""
+    require("torch")
+    from engram.rtrl.core import TITANSConfig, TITANSMemory
+
+    cfg = TITANSConfig(key_dim=8, value_dim=4, hidden_dim=8, gated=True)
+    mem = TITANSMemory(cfg)
+    B = mem.net.B
+    key = np.ones(8, dtype=np.float32) / np.sqrt(8)
+    val = np.array([1.0, 0.0, 0.5, -0.5], dtype=np.float32)
+
+    # Warm up so state is non-trivial
+    for _ in range(10):
+        mem.step(key, val)
+
+    net = mem.net
+    outputs_before   = _to_np(B, net.outputs)
+    p_matrix_before  = _to_np(B, net.p_matrix)
+    p_old_before     = _to_np(B, net.p_matrix_old)
+    gate_before      = _to_np(B, net.gate_values)
+    prev_out_before  = _to_np(B, net.prev_outputs)
+
+    _ = mem.read(key)
+
+    np.testing.assert_allclose(_to_np(B, net.outputs),      outputs_before,  atol=1e-6, err_msg="read() mutated outputs")
+    np.testing.assert_allclose(_to_np(B, net.p_matrix),     p_matrix_before, atol=1e-6, err_msg="read() mutated p_matrix")
+    np.testing.assert_allclose(_to_np(B, net.p_matrix_old), p_old_before,    atol=1e-6, err_msg="read() mutated p_matrix_old")
+    np.testing.assert_allclose(_to_np(B, net.gate_values),  gate_before,     atol=1e-6, err_msg="read() mutated gate_values")
+    np.testing.assert_allclose(_to_np(B, net.prev_outputs), prev_out_before, atol=1e-6, err_msg="read() mutated prev_outputs")
+
+
+@test_group("Neural Memory")
+def test_titans_surprise_is_non_mutating():
+    """surprise() must not alter recurrent state."""
+    require("torch")
+    from engram.rtrl.core import TITANSConfig, TITANSMemory
+
+    cfg = TITANSConfig(key_dim=8, value_dim=4, hidden_dim=8, gated=True)
+    mem = TITANSMemory(cfg)
+    B = mem.net.B
+    key = np.array([1, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+    val = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+
+    for _ in range(10):
+        mem.step(key, val)
+
+    net = mem.net
+    outputs_before  = _to_np(B, net.outputs)
+    p_matrix_before = _to_np(B, net.p_matrix)
+    gate_before     = _to_np(B, net.gate_values)
+
+    _ = mem.surprise(key, val)
+
+    np.testing.assert_allclose(_to_np(B, net.outputs),     outputs_before,  atol=1e-6, err_msg="surprise() mutated outputs")
+    np.testing.assert_allclose(_to_np(B, net.p_matrix),    p_matrix_before, atol=1e-6, err_msg="surprise() mutated p_matrix")
+    np.testing.assert_allclose(_to_np(B, net.gate_values), gate_before,     atol=1e-6, err_msg="surprise() mutated gate_values")
+
+
+@test_group("Neural Memory")
+def test_titans_read_consistent_with_step_predicted():
+    """read(key) before step(key, val) must match step()'s 'predicted' field."""
+    require("torch")
+    from engram.rtrl.core import TITANSConfig, TITANSMemory
+
+    cfg = TITANSConfig(key_dim=8, value_dim=4, hidden_dim=8, gated=True)
+    mem = TITANSMemory(cfg)
+    key = np.array([0, 1, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+    val = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+    for _ in range(5):
+        mem.step(key, val)
+
+    # read() and step()'s predicted must agree on the same network state
+    predicted_via_read = mem.read(key)
+    result = mem.step(key, val)
+    predicted_via_step = result["predicted"]
+
+    np.testing.assert_allclose(
+        predicted_via_read, predicted_via_step, atol=1e-6,
+        err_msg="read() and step()['predicted'] disagree on same state"
+    )
+
+
+# ── Neural coordinator: query_neural_context and candidate_affinity ────────────
+
+@test_group("Neural Memory")
+def test_query_neural_context_returns_predicted_value():
+    """query_neural_context() returns a predicted_value array of correct shape."""
+    require("torch")
+    from engram.rtrl.neural_memory import NeuralMemory, NeuralMemoryConfig
+    from engram.memory.neural_coordinator import NeuralCoordinator
+
+    class _FakeEmb:
+        def embed(self, text):
+            return np.random.randn(64).astype(np.float32)
+
+    class _FakeProj:
+        def __init__(self, out_dim):
+            self._dim = out_dim
+            self._W = np.random.randn(out_dim, 64).astype(np.float32)
+        def __call__(self, x):
+            return self._W @ x
+
+    with TempDir() as d:
+        cfg = NeuralMemoryConfig(hidden_dim=32, value_dim=16)
+        neural = NeuralMemory(project_dir=d, config=cfg)
+        coord = NeuralCoordinator(
+            neural=neural,
+            key_projector=_FakeProj(cfg.key_dim),
+            value_projector=_FakeProj(cfg.value_dim),
+            embedding_service=_FakeEmb(),
+        )
+        ctx = coord.query_neural_context("What is asyncio?")
+        assert ctx is not None
+        assert "predicted_value" in ctx
+        assert ctx["predicted_value"].shape == (cfg.value_dim,)
+        assert "query_surprise" in ctx
+        assert "warmed_up" in ctx
+        assert "surprise_ratio" in ctx
+
+
+@test_group("Neural Memory")
+def test_query_surprise_backward_compatible():
+    """query_surprise() must not include predicted_value (backward compat)."""
+    require("torch")
+    from engram.rtrl.neural_memory import NeuralMemory, NeuralMemoryConfig
+    from engram.memory.neural_coordinator import NeuralCoordinator
+
+    class _FakeEmb:
+        def embed(self, text):
+            return np.random.randn(64).astype(np.float32)
+
+    class _FakeProj:
+        def __init__(self, out_dim):
+            self._W = np.random.randn(out_dim, 64).astype(np.float32)
+        def __call__(self, x):
+            return self._W @ x
+
+    with TempDir() as d:
+        cfg = NeuralMemoryConfig(hidden_dim=32, value_dim=16)
+        neural = NeuralMemory(project_dir=d, config=cfg)
+        coord = NeuralCoordinator(
+            neural=neural,
+            key_projector=_FakeProj(cfg.key_dim),
+            value_projector=_FakeProj(cfg.value_dim),
+            embedding_service=_FakeEmb(),
+        )
+        result = coord.query_surprise("some query")
+        assert result is not None
+        assert "predicted_value" not in result
+        assert "query_surprise" in result
+
+
+@test_group("Neural Memory")
+def test_candidate_affinity_returns_float_in_range():
+    """candidate_affinity() returns a float in [-1, 1]."""
+    require("torch")
+    from engram.rtrl.neural_memory import NeuralMemory, NeuralMemoryConfig
+    from engram.memory.neural_coordinator import NeuralCoordinator
+
+    class _FakeEmb:
+        def embed(self, text):
+            return np.random.randn(64).astype(np.float32)
+
+    class _FakeProj:
+        def __init__(self, out_dim):
+            self._W = np.random.randn(out_dim, 64).astype(np.float32)
+        def __call__(self, x):
+            return self._W @ x
+
+    with TempDir() as d:
+        cfg = NeuralMemoryConfig(hidden_dim=32, value_dim=16)
+        neural = NeuralMemory(project_dir=d, config=cfg)
+        coord = NeuralCoordinator(
+            neural=neural,
+            key_projector=_FakeProj(cfg.key_dim),
+            value_projector=_FakeProj(cfg.value_dim),
+            embedding_service=_FakeEmb(),
+        )
+        predicted = np.random.randn(cfg.value_dim).astype(np.float32)
+        score = coord.candidate_affinity(predicted, "some candidate text")
+        assert isinstance(score, float)
+        assert -1.0 <= score <= 1.0
+
+
+@test_group("Neural Memory")
+def test_neural_affinity_weight_in_retrieval_policy():
+    """RetrievalPolicy exposes neural_affinity_weight with correct default."""
+    from engram.memory.retrieval import RetrievalPolicy
+    policy = RetrievalPolicy()
+    assert hasattr(policy, "neural_affinity_weight")
+    assert 0.0 < policy.neural_affinity_weight <= 0.20
+
+
+# ── Neural consolidation pipeline ─────────────────────────────────────────────
+
+@test_group("Neural Memory")
+def test_record_retrieval_affinities_counts_episodic_only():
+    """record_retrieval_affinities() ignores semantic/cold candidates."""
+    require("torch")
+    from engram.rtrl.neural_memory import NeuralMemory, NeuralMemoryConfig
+    from engram.memory.neural_coordinator import NeuralCoordinator
+    from engram.memory.retrieval import RetrievalCandidate
+
+    class _FakeEmb:
+        def embed(self, text):
+            return np.random.randn(64).astype(np.float32)
+
+    class _FakeProj:
+        def __init__(self, out_dim):
+            self._W = np.random.randn(out_dim, 64).astype(np.float32)
+        def __call__(self, x):
+            return self._W @ x
+
+    with TempDir() as d:
+        cfg = NeuralMemoryConfig(hidden_dim=32, value_dim=16)
+        neural = NeuralMemory(project_dir=d, config=cfg)
+        coord = NeuralCoordinator(
+            neural=neural,
+            key_projector=_FakeProj(cfg.key_dim),
+            value_projector=_FakeProj(cfg.value_dim),
+            embedding_service=_FakeEmb(),
+        )
+
+        candidates = [
+            RetrievalCandidate("episodic", "text A", None, 10, 0.8,
+                               source_id="ep-001",
+                               metadata={"neural_affinity": 0.5}),
+            RetrievalCandidate("semantic", "text B", None, 10, 0.7,
+                               source_id="sem-001",
+                               metadata={"neural_affinity": 0.5}),
+            RetrievalCandidate("episodic", "text C", None, 10, 0.6,
+                               source_id="ep-002",
+                               metadata={"neural_affinity": 0.05}),  # below threshold
+        ]
+        coord.record_retrieval_affinities(candidates)
+
+        assert coord._affinity_hits.get("ep-001", 0) == 1, "ep-001 should have 1 hit"
+        assert "sem-001" not in coord._affinity_hits, "semantic candidates ignored"
+        assert "ep-002" not in coord._affinity_hits, "low-affinity candidates ignored"
+
+
+@test_group("Neural Memory")
+def test_consolidation_candidates_clears_after_return():
+    """consolidation_candidates() returns qualifying IDs and clears their counts."""
+    require("torch")
+    from engram.rtrl.neural_memory import NeuralMemory, NeuralMemoryConfig
+    from engram.memory.neural_coordinator import NeuralCoordinator
+    from engram.memory.retrieval import RetrievalCandidate
+
+    class _FakeEmb:
+        def embed(self, text):
+            return np.random.randn(64).astype(np.float32)
+
+    class _FakeProj:
+        def __init__(self, out_dim):
+            self._W = np.random.randn(out_dim, 64).astype(np.float32)
+        def __call__(self, x):
+            return self._W @ x
+
+    with TempDir() as d:
+        cfg = NeuralMemoryConfig(hidden_dim=32, value_dim=16)
+        neural = NeuralMemory(project_dir=d, config=cfg)
+        coord = NeuralCoordinator(
+            neural=neural,
+            key_projector=_FakeProj(cfg.key_dim),
+            value_projector=_FakeProj(cfg.value_dim),
+            embedding_service=_FakeEmb(),
+        )
+
+        # Simulate 2 retrieval rounds for ep-001, 1 for ep-002
+        for _ in range(2):
+            coord.record_retrieval_affinities([
+                RetrievalCandidate("episodic", "text", None, 10, 0.8,
+                                   source_id="ep-001",
+                                   metadata={"neural_affinity": 0.4}),
+            ])
+        coord.record_retrieval_affinities([
+            RetrievalCandidate("episodic", "text", None, 10, 0.8,
+                               source_id="ep-002",
+                               metadata={"neural_affinity": 0.4}),
+        ])
+
+        candidates = coord.consolidation_candidates(min_hits=2)
+        assert "ep-001" in candidates, "ep-001 should qualify with 2 hits"
+        assert "ep-002" not in candidates, "ep-002 has only 1 hit"
+
+        # After return, ep-001 count cleared; ep-002 still accumulating
+        assert "ep-001" not in coord._affinity_hits, "ep-001 cleared after consolidation"
+        assert coord._affinity_hits.get("ep-002", 0) == 1, "ep-002 count preserved"
+
+
+@test_group("Neural Memory")
+def test_reset_clears_affinity_hits():
+    """reset() clears accumulated affinity hits."""
+    require("torch")
+    from engram.rtrl.neural_memory import NeuralMemory, NeuralMemoryConfig
+    from engram.memory.neural_coordinator import NeuralCoordinator
+    from engram.memory.retrieval import RetrievalCandidate
+
+    class _FakeEmb:
+        def embed(self, text):
+            return np.random.randn(64).astype(np.float32)
+
+    class _FakeProj:
+        def __init__(self, out_dim):
+            self._W = np.random.randn(out_dim, 64).astype(np.float32)
+        def __call__(self, x):
+            return self._W @ x
+
+    with TempDir() as d:
+        cfg = NeuralMemoryConfig(hidden_dim=32, value_dim=16)
+        neural = NeuralMemory(project_dir=d, config=cfg)
+        coord = NeuralCoordinator(
+            neural=neural,
+            key_projector=_FakeProj(cfg.key_dim),
+            value_projector=_FakeProj(cfg.value_dim),
+            embedding_service=_FakeEmb(),
+        )
+        coord.record_retrieval_affinities([
+            RetrievalCandidate("episodic", "text", None, 10, 0.8,
+                               source_id="ep-001",
+                               metadata={"neural_affinity": 0.4}),
+        ])
+        assert coord._affinity_hits  # non-empty
+        coord.reset()
+        assert not coord._affinity_hits, "reset() should clear affinity hits"

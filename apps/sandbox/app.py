@@ -674,6 +674,12 @@ def main() -> None:
         for label, value in _sidebar_health_snapshot(engine_cfg, ui_cfg):
             st.caption(f"**{label}:** {value}")
 
+        try:
+            import engram as _engram
+            st.caption(f"Engram v{_engram.__version__}")
+        except Exception:
+            pass
+
         st.divider()
         st.subheader("Session Mode")
         ui_cfg.endpoint_only_mode = st.toggle(

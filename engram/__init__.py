@@ -10,7 +10,7 @@ Public surface:
 - Lazy exports for episodic, semantic, filter, and neural components
 """
 
-__version__ = "0.1.16"
+__version__ = "0.1.19"
 
 from .project_memory import (
     ContextResult,

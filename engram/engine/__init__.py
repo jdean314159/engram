@@ -16,6 +16,8 @@ __all__ = [
     "VLLMEngine",
     "OllamaEngine",
     "ClaudeEngine",
+    "GeminiEngine",
+    "OpenAICloudEngine",
     "StructuredOutputHandler",
     "FailoverEngine",
     "FailoverPolicy",
@@ -38,6 +40,12 @@ def __getattr__(name):
     if name == "ClaudeEngine":
         from .claude_engine import ClaudeEngine
         return ClaudeEngine
+    if name == "GeminiEngine":
+        from .gemini_engine import GeminiEngine
+        return GeminiEngine
+    if name == "OpenAICloudEngine":
+        from .openai_cloud_engine import OpenAICloudEngine
+        return OpenAICloudEngine
     if name == "StructuredOutputHandler":
         from .utils.structured_output import StructuredOutputHandler
         return StructuredOutputHandler
