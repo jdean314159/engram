@@ -189,7 +189,13 @@ class UnifiedRetriever:
         # because they already contain enough context — the extra tokens add
         # negligible signal.
         embedding_query = self._expand_query_for_embedding(query, query_terms)
-        episodes = self.project_memory.search_episodes(embedding_query, n=n)
+        # Fetch more candidates than needed so the scoring function can rerank.
+        # This is critical for contradiction resolution: if n=1, ChromaDB returns
+        # only the highest embedding-similarity episode, which may be the contradicting
+        # version. Fetching n*3 gives the scorer a chance to prefer the canonical
+        # based on recency, importance, and lexical overlap.
+        fetch_n = max(n * 3, n + 5)
+        episodes = self.project_memory.search_episodes(embedding_query, n=fetch_n)
         out: List[RetrievalCandidate] = []
         now = time.time()
 
@@ -199,7 +205,15 @@ class UnifiedRetriever:
             importance = float(getattr(ep, "importance", 0.5) or 0.5)
             timestamp = float(getattr(ep, "timestamp", now) or now)
             age_days = max(0.0, (now - timestamp) / 86400.0)
-            recency = max(0.0, 1.0 - min(age_days / 30.0, 1.0))
+            # Two-scale recency: fine-grained for recent episodes (within 1 day),
+            # coarse for older ones. This makes hour-level differences visible
+            # in retrieval ranking, which matters for contradiction resolution.
+            if age_days < 1.0:
+                # Within last 24h: normalize over 24h window (0→1 day = 1.0→0.0)
+                recency = max(0.0, 1.0 - age_days)
+            else:
+                # Older: normalize over 30-day window, capped at 0.0
+                recency = max(0.0, 1.0 - min(age_days / 30.0, 1.0))
             lexical = self._lexical_overlap_terms(query_terms, text)
             density = self._term_density(query_terms, text)
 

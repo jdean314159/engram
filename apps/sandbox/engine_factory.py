@@ -60,7 +60,7 @@ def create_project_memory(
 
     pm = ProjectMemory(
         project_id="default",
-        project_type="programming_assistant",
+        project_type="general_assistant",
         base_dir=project_dir,
         llm_engine=engine,
         token_budget=budget,

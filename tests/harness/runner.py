@@ -214,3 +214,5 @@ def test_group(name: str):
         RUNNER.register(name, fn)
         return fn
     return decorator
+
+test_group.__test__ = False

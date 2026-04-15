@@ -44,7 +44,7 @@ class IngestionDecision:
 class IngestionPolicy:
     """Configurable write-policy surface for conversational memory formation."""
 
-    episode_threshold: float = 0.62
+    episode_threshold: float = 0.35
     max_episode_chars: int = 1200
     dedup_search_n: int = 3
     ephemeral_patterns: Sequence[Pattern[str]] = field(default_factory=tuple)
@@ -58,7 +58,7 @@ class IngestionPolicy:
         pt = str(getattr(project_type, "value", project_type) or "").lower()
 
         base = cls(
-            episode_threshold=0.62,
+            episode_threshold=0.35,
             max_episode_chars=1200,
             dedup_search_n=3,
             ephemeral_patterns=(
@@ -167,12 +167,17 @@ class MemoryIngestor:
         score = signals["score"]
         decision.reasons.extend(signals["reasons"])
 
-        semantic_writes = self._dedupe_semantic_writes(self._extract_semantic_writes(text))
+        semantic_writes = self._dedupe_semantic_writes(
+            self._extract_semantic_writes(text, role=role)
+        )
         decision.semantic_writes.extend(semantic_writes)
         if semantic_writes:
             decision.reasons.append("semantic_candidates")
             score += min(0.18, 0.06 * len(semantic_writes))
 
+        logger.info("ingestion: role=%s score=%.2f threshold=%.2f will_store=%s",
+                    role, score, self.policy.episode_threshold,
+                    score >= self.policy.episode_threshold)
         episode_text = paired_text if paired_text else text
         episode_text = episode_text[: self.policy.max_episode_chars].strip()
         decision.episode_text = episode_text
@@ -207,11 +212,11 @@ class MemoryIngestor:
                         "source_text": decision.source_text[:400],
                     },
                     importance=decision.episode_importance,
-                    bypass_filter=False,
+                    bypass_filter=True,
                 )
                 outcome["episode_id"] = episode_id
             except Exception as exc:
-                logger.debug("Episode ingestion failed: %s", exc)
+                logger.warning("Episode ingestion failed: %s", exc)
 
         if self.project_memory.semantic is not None:
             for write in decision.semantic_writes:
@@ -266,7 +271,7 @@ class MemoryIngestor:
             reasons.append("task_state_signal")
 
         if role == "assistant":
-            score += 0.08
+            score += 0.20
             reasons.append("assistant_turn_summary")
 
         words = len(text.split())
@@ -276,7 +281,18 @@ class MemoryIngestor:
 
         return {"score": min(1.0, score), "reasons": reasons}
 
-    def _extract_semantic_writes(self, text: str) -> List[SemanticMemoryWrite]:
+    _LLM_BOILERPLATE = re.compile(
+        r"^I (?:can |will |would |could |am happy to|am ready|understand|noticed|"
+        r"have analyzed|see that|think|believe|suggest|recommend)",
+        re.IGNORECASE,
+    )
+
+    def _extract_semantic_writes(self, text: str, role: str = "user") -> List[SemanticMemoryWrite]:
+        # Assistant turns: no fact extraction — LLM first-person statements
+        # are not facts about the user or project.
+        # Preference extraction also skipped: only meaningful from user speech.
+        if role == "assistant":
+            return []
         writes: List[SemanticMemoryWrite] = []
 
         for pattern in self.policy.preference_patterns:

@@ -67,22 +67,12 @@ def test_semantic_add_and_query_node():
 
 @test_group("Semantic Memory")
 def test_semantic_add_preference():
-    require("kuzu")
     with TempDir() as d:
         sm = _make_semantic(d / "sem")
-        sm.add_node("Preference", "pref_pytest", {
-            "category": "testing",
-            "value": "pytest over unittest",
-            "strength": 0.85,
-            "timestamp": time.time(),
-        })
-        rows = sm.query(
-            "MATCH (p:Preference) WHERE p.category = 'testing' RETURN p.value, p.strength"
-        )
+        sm.add_preference(category="testing", value="pytest over unittest", strength=0.85)
+        rows = sm.list_preferences(limit=10)
         assert len(rows) >= 1
-        values = [r.get("p.value", r.get("value", "")) for r in rows]
-        assert any("pytest" in v for v in values)
-
+        assert any("pytest" in r.get("value", "") for r in rows)
 
 @test_group("Semantic Memory")
 def test_semantic_add_relationship():
@@ -194,21 +184,16 @@ def test_semantic_get_stats():
 @test_group("Semantic Memory")
 def test_semantic_persistence():
     """Graph data survives close/reopen."""
-    require("kuzu")
     from engram.memory.semantic_memory import SemanticMemory
     from engram.memory.types import ProjectType
 
     with TempDir() as d:
         db_path = d / "sem"
-        sm1 = SemanticMemory(db_path=db_path,
-                              project_type=ProjectType.PROGRAMMING_ASSISTANT)
+        sm1 = SemanticMemory(db_path=db_path)
         sm1.add_fact("Persistent fact for testing", confidence=0.8)
-        if hasattr(sm1, "close"):
-            sm1.close()
-
-        sm2 = SemanticMemory(db_path=db_path,
-                              project_type=ProjectType.PROGRAMMING_ASSISTANT)
-        rows = sm2.query("MATCH (f:Fact) RETURN f.id")
+        sm1.close()
+        sm2 = SemanticMemory(db_path=db_path)
+        rows = sm2.list_facts(limit=10)
         assert len(rows) >= 1
 
 
