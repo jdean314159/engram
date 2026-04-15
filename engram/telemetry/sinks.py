@@ -29,7 +29,7 @@ class JsonlFileSink:
     """Append telemetry events to a JSONL file."""
 
     def __init__(self, path: Path):
-        self.path = Path(path)
+        self.path = Path(path).expanduser().resolve(strict=False)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def emit(self, event: TelemetryEvent) -> None:

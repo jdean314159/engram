@@ -146,7 +146,7 @@ class EpisodicMemory:
 
         # Initialize ChromaDB client
         if persist_dir:
-            persist_dir = Path(persist_dir)
+            persist_dir = Path(persist_dir).expanduser().resolve(strict=False)
             persist_dir.mkdir(parents=True, exist_ok=True)
             self.client = chromadb.PersistentClient(
                 path=str(persist_dir),
@@ -404,6 +404,85 @@ class EpisodicMemory:
             return 0
         self.collection.delete(ids=ids)
         return len(ids)
+
+    def find_similar_episodes(
+        self,
+        text: str,
+        project_id: Optional[str] = None,
+        n: int = 5,
+        similarity_threshold: float = 0.92,
+    ) -> List[tuple]:
+        """Find existing episodes with cosine similarity above threshold.
+
+        Returns list of (episode_id, similarity_score) tuples, sorted by
+        similarity descending. Used for deduplication before storing a new
+        episode.
+
+        Args:
+            text: New episode text to compare against.
+            project_id: Restrict search to this project.
+            n: Max candidates to retrieve before threshold filtering.
+            similarity_threshold: Minimum cosine similarity (0-1) to flag
+                                  as a near-duplicate. 0.92 is conservative
+                                  — catches paraphrases of the same fact
+                                  while leaving distinct-but-related facts
+                                  alone.
+        """
+        if not text.strip():
+            return []
+        try:
+            # Embed the new text using the same model as the collection
+            new_vec = self.embedding_fn.model.encode(
+                [text], normalize_embeddings=True
+            )[0]
+
+            # Retrieve top-n candidates via ChromaDB semantic search
+            episodes = self.search(query=text, n=n, project_id=project_id)
+            if not episodes:
+                return []
+
+            # Re-embed candidates and compute exact cosine similarity
+            # (ChromaDB distances are approximate; we want exact scores)
+            candidate_texts = [ep.text for ep in episodes]
+            candidate_vecs = self.embedding_fn.model.encode(
+                candidate_texts, normalize_embeddings=True
+            )
+            similarities = candidate_vecs @ new_vec  # dot product of unit vecs = cosine sim
+
+            results = []
+            for ep, sim in zip(episodes, similarities):
+                if float(sim) >= similarity_threshold:
+                    results.append((ep.id, float(sim)))
+
+            results.sort(key=lambda x: x[1], reverse=True)
+            return results
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "find_similar_episodes failed: %s", e
+            )
+            return []
+
+    def tombstone_episodes(self, ids: List[str]) -> int:
+        """Mark episodes as superseded by deleting them.
+
+        Currently a thin wrapper over delete_episodes. In future this will
+        set a 'superseded_by' metadata field instead of deleting, supporting
+        Option 4 (explicit version tracking) non-destructive semantics.
+
+        Args:
+            ids: Episode IDs to tombstone.
+
+        Returns:
+            Number of episodes tombstoned.
+        """
+        if not ids:
+            return 0
+        import logging
+        logging.getLogger(__name__).info(
+            "Tombstoning %d superseded episode(s): %s", len(ids), ids
+        )
+        return self.delete_episodes(ids)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get collection statistics.

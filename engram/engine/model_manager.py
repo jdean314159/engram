@@ -873,7 +873,7 @@ def scan_local_model(path: Path) -> Optional[LocalModelInfo]:
 
     Returns LocalModelInfo or None if not a recognized model.
     """
-    path = Path(path).resolve()
+    path = Path(path).expanduser().resolve(strict=False)
 
     if path.is_file() and path.suffix == ".gguf":
         return LocalModelInfo(

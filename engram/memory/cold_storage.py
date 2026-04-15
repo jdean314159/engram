@@ -56,7 +56,7 @@ class ColdStorage:
         # If db_path isn't provided, default to a per-user location.
         if db_path is None:
             db_path = Path.home() / ".engram" / "cold.db"
-        self.db_path = Path(db_path)
+        self.db_path = Path(db_path).expanduser().resolve(strict=False)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._local = threading.local()

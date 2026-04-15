@@ -69,7 +69,7 @@ class EmbeddingCache:
         self._disk: Optional[Any] = None
         if cache_dir is not None and HAS_DISKCACHE and enabled:
             try:
-                disk_path = Path(cache_dir)
+                disk_path = Path(cache_dir).expanduser().resolve(strict=False)
                 disk_path.mkdir(parents=True, exist_ok=True)
                 self._disk = DiskCache(str(disk_path))
                 logger.info("Disk embedding cache at %s", disk_path)

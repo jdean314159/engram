@@ -113,7 +113,7 @@ class AccessTracker:
     """
 
     def __init__(self, db_path: Path):
-        self.db_path = Path(db_path)
+        self.db_path = Path(db_path).expanduser().resolve(strict=False)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._init_schema()
@@ -340,7 +340,7 @@ class ForgettingPolicy:
         for row in all_rows:
             eid = row["id"]
             timestamp = row["timestamp"]
-            importance = row["importance"]
+            importance = row["importance"] or 0.0 or 0.0
             inner_meta = row.get("metadata", "{}")
             if isinstance(inner_meta, str):
                 try:

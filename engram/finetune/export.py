@@ -221,7 +221,7 @@ def _read_working_db(project_memory, config: ExportConfig) -> List[_Turn]:
     db_path = getattr(project_memory, "_project_dir", None)
     if db_path is None:
         return []
-    db_file = Path(db_path) / "working.db"
+    db_file = Path(db_path).expanduser().resolve(strict=False) / "working.db"
     if not db_file.exists():
         return []
 
@@ -432,7 +432,7 @@ def export_to_file(
         raise ValueError(f"Unknown format {format!r}. Choose: openai, alpaca, raw")
 
     config = config or ExportConfig()
-    path = Path(path)
+    path = Path(path).expanduser().resolve(strict=False)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Resolve system prompt

@@ -166,7 +166,7 @@ class NeuralMemory:
             config: Configuration. None = optimal defaults.
         """
         self.config = config or NeuralMemoryConfig()
-        self.project_dir = Path(project_dir) if project_dir else None
+        self.project_dir = Path(project_dir).expanduser().resolve(strict=False) if project_dir else None
         self._memory: Optional[TITANSMemory] = None
         self._session_start = time.time()
         self._memory_role = "auxiliary_embedding_memory"
@@ -337,7 +337,7 @@ class NeuralMemory:
         if self._memory is None:
             return
 
-        save_path = Path(path) if path else self._save_path()
+        save_path = Path(path).expanduser().resolve(strict=False) if path else self._save_path()
         if save_path is None:
             logger.warning("No save path configured for neural memory")
             return

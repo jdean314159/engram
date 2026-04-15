@@ -39,12 +39,15 @@ import os
 import threading
 import time
 import numpy as np
+import sqlite3
 
 from .utils.logging_setup import setup_logging_if_needed
 from .telemetry import Telemetry, LoggingSink, JsonlFileSink
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from .memory.event_bus import EventBus, TurnEvent
+from .memory.daemon import MemoryDaemon
 
 if TYPE_CHECKING:
     from .memory.episodic_memory import Episode
@@ -334,7 +337,7 @@ def _build_layers(
     """
     from pathlib import Path as _Path
 
-    project_dir = _Path(project_dir)
+    project_dir = _Path(project_dir).expanduser().resolve(strict=False)
 
     # --- Embedding Cache ---
     embedding_cache = EmbeddingCache(
@@ -367,7 +370,8 @@ def _build_layers(
     # --- Layer 3: Semantic Memory (requires kuzu) ---
     semantic = None
     try:
-        from .memory.semantic_memory import SemanticMemory, ProjectType as PT
+        from .memory.semantic_memory import SemanticMemory
+        from .memory.types import ProjectType as PT
         if isinstance(project_type, str):
             pt_raw = project_type.strip().lower()
             alias_map = {
@@ -519,6 +523,7 @@ class ProjectMemory:
         forgetting_config: Optional[ForgettingConfig] = None,
         lifecycle_config: Optional[LifecycleConfig] = None,
         ingestion_policy: Optional[IngestionPolicy] = None,
+        dedup_threshold: float = 0.92,
     ):
         """Initialize isolated project memory.
 
@@ -544,8 +549,11 @@ class ProjectMemory:
             sink = str(os.getenv("ENGRAM_TELEMETRY_SINK", "log")).lower()
             if enable:
                 if sink == "jsonl":
-                    path = Path(os.getenv("ENGRAM_TELEMETRY_PATH",
-                                str(Path.home() / ".engram" / "telemetry.jsonl")))
+                    raw_path = os.getenv(
+                        "ENGRAM_TELEMETRY_PATH",
+                        str(Path.home() / ".engram" / "telemetry.jsonl"),
+                    )
+                    path = Path(raw_path).expanduser().resolve(strict=False)
                     telemetry = Telemetry(sink=JsonlFileSink(path), enabled=True)
                 else:
                     telemetry = Telemetry(sink=LoggingSink(), enabled=True)
@@ -559,9 +567,12 @@ class ProjectMemory:
         self.llm_engine = llm_engine
         self.budget = token_budget or TokenBudget()
         self._token_counter = token_counter or _default_token_counter
-        self._project_dir = Path(base_dir) / project_id
+
+        base_dir = Path(base_dir).expanduser().resolve(strict=False)
+        self._project_dir = base_dir / project_id
         self._project_dir.mkdir(parents=True, exist_ok=True)
 
+        self._dedup_threshold = dedup_threshold  # 0.0 = disabled, 0.92 = conservative dedup
         logger.info("Initializing project memory: %s at %s", project_id, self._project_dir)
 
         # --- Build all memory layers ---
@@ -668,6 +679,16 @@ class ProjectMemory:
         self.ingestor = MemoryIngestor(ctx, policy=ingestion_policy)
         self.retriever = UnifiedRetriever(ctx)
         self.lifecycle = MemoryLifecycleManager(ctx, config=lifecycle_config)
+        # --- Async ingestion pipeline (must start after ingestor is ready) ---
+        self._event_bus = EventBus()
+        self._daemon = MemoryDaemon(self, self._event_bus)
+        self._daemon.start()
+        # Validate all layers at startup
+        try:
+            self.health_check()
+        except RuntimeError as exc:
+            logger.error("ProjectMemory init failed health check: %s", exc)
+            raise
     def _store_experiment_episode_summary(
         self,
         run_id: str,
@@ -794,6 +815,7 @@ class ProjectMemory:
         The neural surprise score is attached to the Message metadata.
         """
         started = time.perf_counter()
+        logger.info("add_turn: role=%s chars=%d", role, len(content))
         msg = self.working.add(role, content, metadata)
 
         # Feed neural memory if active
@@ -802,47 +824,39 @@ class ProjectMemory:
 
         # Centralized memory formation pipeline. Prefer to store assistant turns
         # as a paired exchange with the immediately preceding user turn.
+        # Async ingestion: push to event bus, daemon processes in background.
+        # Working memory write above is synchronous; ingestion is decoupled.
         try:
+            importance = 0.5
+            if msg.metadata and "importance" in msg.metadata:
+                importance = float(msg.metadata["importance"])
             paired_text = None
             if role == "assistant":
                 recent = self.working.get_recent(2)
                 if len(recent) >= 2 and recent[1].role == "user":
                     paired_text = f"User: {recent[1].content}\nAssistant: {recent[0].content}"
-            decision = self.ingestor.process_turn(
+            event = TurnEvent(
                 role=role,
-                content=content,
-                metadata=metadata,
+                text=content,
+                importance=importance,
+                session_id=self.session_id,
+                metadata=metadata or {},
                 paired_text=paired_text,
             )
-            outcome = self.ingestor.apply(decision)
+            result = self._event_bus.put(event)
             if msg.metadata is None:
                 msg.metadata = {}
-            msg.metadata["ingestion"] = outcome["decision"]
-            if outcome.get("episode_id"):
-                msg.metadata["episode_id"] = outcome["episode_id"]
-                if decision.episode_importance >= getattr(self.lifecycle.config, "auto_promote_importance", 1.1):
-                    promo = self.lifecycle.promote_episode(
-                        episode_id=outcome["episode_id"],
-                        text=decision.episode_text or decision.source_text,
-                        importance=decision.episode_importance,
-                        metadata={"source_turn_role": role, "session_id": self.session_id},
-                        source="ingestion",
-                    )
-                    msg.metadata["lifecycle_promotion"] = promo
-            msg.metadata["semantic_writes"] = outcome.get("semantic_writes", 0)
+            msg.metadata["event_bus"] = result
             self.telemetry.emit(
                 "memory_ingest",
-                "memory ingestion decision applied",
+                "turn event queued",
                 project_id=self.project_id,
                 session_id=self.session_id,
                 role=role,
-                should_store_episode=decision.should_store_episode,
-                episode_id=outcome.get("episode_id"),
-                semantic_writes=outcome.get("semantic_writes", 0),
-                reasons=decision.reasons,
+                event_bus_result=result,
             )
         except Exception as e:
-            logger.debug("Memory ingestion pipeline failed: %s", e)
+            logger.debug("Event bus enqueue failed: %s", e)
 
         self.telemetry.emit(
             "perf_span",
@@ -1036,6 +1050,7 @@ class ProjectMemory:
         metadata: Optional[Dict[str, Any]] = None,
         importance: float = 0.5,
         bypass_filter: bool = False,
+        bypass_dedup: bool = False,
     ) -> Optional[str]:
         """Store an episode if it passes the surprise filter.
 
@@ -1094,6 +1109,28 @@ class ProjectMemory:
             importance,
             neural_importance if neural_importance is not None else 0.0,
         )
+
+        # Deduplication: tombstone near-duplicate episodes before storing.
+        # Threshold 0.92 catches paraphrases of the same fact while leaving
+        # distinct-but-related episodes intact.
+        dedup_threshold = getattr(self, "_dedup_threshold", 0.92)
+        if dedup_threshold > 0.0 and not bypass_dedup:
+            try:
+                similar = self.episodic.find_similar_episodes(
+                    text=text,
+                    project_id=self.project_id,
+                    n=5,
+                    similarity_threshold=dedup_threshold,
+                )
+                if similar:
+                    ids_to_tombstone = [eid for eid, _ in similar]
+                    n_tombstoned = self.episodic.tombstone_episodes(ids_to_tombstone)
+                    logger.debug(
+                        "Dedup: tombstoned %d episode(s) before storing new episode",
+                        n_tombstoned,
+                    )
+            except Exception as e:
+                logger.warning("Deduplication check failed: %s", e)
 
         episode_id = self.episodic.add_episode(
             text=text,
@@ -1266,6 +1303,85 @@ class ProjectMemory:
         }
 
 
+    def _hierarchical_compress(
+        self,
+        sections,
+        neural_hint: str,
+        available_tokens: int,
+        count_fn,
+    ) -> str:
+        """Compress memory content using layer priority to stay within available_tokens.
+
+        Compression order (most expendable first):
+          1. Drop cold storage
+          2. Drop neural hint
+          3. Truncate episodic (retrieved excerpts, most compressible)
+          4. Truncate working memory (keep most recent turns)
+          5. Semantic is non-evictable: drop everything else before touching it
+
+        Replaces the flat LLM-compress-or-truncate approach with one that
+        respects the information hierarchy from the V2 design.
+        """
+        def _assemble(parts, hint=""):
+            memory_parts = []
+            for key in ("working", "episodic", "semantic", "cold"):
+                val = parts.get(key, "")
+                if val:
+                    memory_parts.append(f"[{key.upper()}]\n{val}")
+            if hint:
+                memory_parts.append(f"[NEURAL CONTEXT]\n{hint}")
+            return "\n\n".join(memory_parts).strip()
+
+        current = dict(sections)
+        hint = neural_hint
+
+        content = _assemble(current, hint)
+        if count_fn(content) <= available_tokens:
+            return content
+
+        # Phase 1: Drop cold storage (lowest retrieval priority)
+        if current.get("cold"):
+            current["cold"] = ""
+            content = _assemble(current, hint)
+            logger.debug("Hierarchical compress phase 1: dropped cold storage")
+            if count_fn(content) <= available_tokens:
+                return content
+
+        # Phase 1b: Drop neural hint (sub-symbolic, least critical under pressure)
+        if hint:
+            hint = ""
+            content = _assemble(current, hint)
+            logger.debug("Hierarchical compress phase 1b: dropped neural hint")
+            if count_fn(content) <= available_tokens:
+                return content
+
+        # Phase 2: Truncate episodic
+        if current.get("episodic"):
+            sem_tok = count_fn(f"[SEMANTIC]\n{current.get('semantic', '')}") if current.get("semantic") else 0
+            work_tok = count_fn(f"[WORKING]\n{current.get('working', '')}") if current.get("working") else 0
+            episodic_budget = max(0, available_tokens - sem_tok - work_tok - 50)
+            current["episodic"] = truncate_to_tokens(current["episodic"], episodic_budget, count_fn)
+            content = _assemble(current, hint)
+            logger.debug("Hierarchical compress phase 2: episodic truncated to %d tokens", episodic_budget)
+            if count_fn(content) <= available_tokens:
+                return content
+
+        # Phase 3: Truncate working memory
+        if current.get("working"):
+            sem_tok = count_fn(f"[SEMANTIC]\n{current.get('semantic', '')}") if current.get("semantic") else 0
+            ep_tok = count_fn(f"[EPISODIC]\n{current.get('episodic', '')}") if current.get("episodic") else 0
+            working_budget = max(0, available_tokens - sem_tok - ep_tok - 50)
+            current["working"] = truncate_to_tokens(current["working"], working_budget, count_fn)
+            content = _assemble(current, hint)
+            logger.debug("Hierarchical compress phase 3: working memory truncated to %d tokens", working_budget)
+            if count_fn(content) <= available_tokens:
+                return content
+
+        # Phase 4 (hard limit): semantic is non-evictable; drop everything else
+        semantic_only = current.get("semantic", "")
+        logger.warning("Hierarchical compress phase 4: extreme pressure - retaining semantic layer only")
+        return f"[SEMANTIC]\n{semantic_only}" if semantic_only else ""
+
     def build_prompt(
         self,
         user_message: str,
@@ -1382,14 +1498,13 @@ class ProjectMemory:
             prompt = assemble_prompt(system_prefix, memory_blob, user_message)
             prompt_tokens = _count(prompt)
 
-        if memory_content and prompt_tokens > usable_prompt_cap and self.llm_engine is not None:
+        if memory_content and prompt_tokens > usable_prompt_cap:
             tail_tokens = _count(f"User: {user_message}\nAssistant:")
             wrapper_overhead = max(0, _count(wrap_memory_block("x")) - _count("x"))
             remaining_for_memory = usable_prompt_cap - head_tokens - tail_tokens - wrapper_overhead - 8
             if remaining_for_memory <= 0:
                 logger.warning(
-                    "Pressure valve: system+user leave no room for retrieved memory (remaining_for_memory=%s). Dropping memory.",
-                    remaining_for_memory,
+                    "Pressure valve: system+user leave no room for retrieved memory. Dropping memory.",
                 )
                 memory_content = ""
                 memory_blob = ""
@@ -1409,7 +1524,7 @@ class ProjectMemory:
 
             self.telemetry.emit(
                 "pressure_valve",
-                "prompt overflow: compress retrieved memory blob",
+                "prompt overflow: hierarchical memory compression",
                 project_id=self.project_id,
                 session_id=self.session_id,
                 prompt_tokens=prompt_tokens,
@@ -1417,16 +1532,13 @@ class ProjectMemory:
                 target_memory_tokens=remaining_for_memory,
             )
 
-            try:
-                compressed_content = self.llm_engine.compress_prompt(memory_content, target_tokens=remaining_for_memory)
-            except Exception as e:
-                logger.warning("Pressure valve compression failed (%s); truncating memory blob", e)
-                ratio = remaining_for_memory / max(1, _count(memory_content))
-                keep_chars = int(len(memory_content) * min(1.0, max(0.05, ratio)))
-                compressed_content = memory_content[:keep_chars]
-
+            memory_content = self._hierarchical_compress(
+                sections=sections,
+                neural_hint=neural_hint,
+                available_tokens=remaining_for_memory,
+                count_fn=_count,
+            )
             compressed = True
-            memory_content = (compressed_content or "").strip()
             memory_blob = wrap_memory_block(memory_content)
             prompt = assemble_prompt(system_prefix, memory_blob, user_message)
             prompt_tokens = _count(prompt)
@@ -1527,7 +1639,7 @@ class ProjectMemory:
         from pathlib import Path as _Path
         from .finetune.export import ExportConfig as _EC, export_to_file as _etf
         cfg = config or _EC()
-        return _etf(self, _Path(path), format=format, config=cfg)
+        return _etf(self, _Path(path).expanduser().resolve(strict=False), format=format, config=cfg)
 
     def export_dataset_stats(self, config=None) -> Dict[str, Any]:
         """Dry-run export: return counts without writing any file.
@@ -1672,6 +1784,8 @@ class ProjectMemory:
             stats["surprise_filter"] = self.surprise.get_stats()
         if self.extractor is not None:
             stats["graph_extractor"] = self.extractor.get_stats()
+        if hasattr(self, "_daemon"):
+            stats["daemon"] = self._daemon.get_stats()
         return stats
 
     def clear_session(self):
@@ -1688,6 +1802,8 @@ class ProjectMemory:
 
     def close(self):
         """Release all resources."""
+        if hasattr(self, "_daemon"):
+            self._daemon.stop(timeout=5.0)
         self.working.close()
         if self.semantic:
             self.semantic.close()
@@ -1718,3 +1834,115 @@ class ProjectMemory:
             f"type={self.project_type.value if hasattr(self.project_type, 'value') else self.project_type}, "
             f"session={self.session_id!r})"
         )
+
+    def health_check(self) -> Dict[str, Any]:
+        """Validate all memory layers are functional.
+
+        Runs a lightweight read/write probe on each layer.
+        Raises RuntimeError if any critical layer fails.
+        Logs WARNING for non-critical failures.
+
+        Returns a report dict suitable for display in the UI or logs.
+        Can be called at any time, not just at init.
+        """
+        report = {
+            "project_id": self.project_id,
+            "timestamp": time.time(),
+            "layers": {},
+            "warnings": [],
+            "critical": [],
+        }
+
+        # --- Working memory (critical) ---
+        try:
+            db_path = self._project_dir / "working.db"
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("SELECT COUNT(*) FROM messages")
+            conn.close()
+            report["layers"]["working"] = "ok"
+        except Exception as exc:
+            report["layers"]["working"] = f"FAILED: {exc}"
+            report["critical"].append(f"Working memory: {exc}")
+
+        # --- Episodic memory (warning) ---
+        if self.episodic is None:
+            report["layers"]["episodic"] = "disabled"
+        else:
+            try:
+                self.episodic.get_recent_episodes(n=1, project_id=self.project_id)
+                report["layers"]["episodic"] = "ok"
+            except Exception as exc:
+                report["layers"]["episodic"] = f"FAILED: {exc}"
+                report["warnings"].append(f"Episodic memory: {exc}")
+                logger.warning("HEALTH CHECK: Episodic memory failed: %s", exc)
+
+        # --- Semantic memory (loud warning) ---
+        if self.semantic is None:
+            report["layers"]["semantic"] = "disabled"
+            report["warnings"].append("Semantic memory is disabled — check initialization logs")
+            logger.warning("HEALTH CHECK: Semantic memory is disabled")
+        else:
+            try:
+                probe_id = f"__health_probe_{int(time.time())}"
+                self.semantic.add_fact(
+                    "__health_probe__",
+                    confidence=0.0,
+                    source="health_check",
+                    fact_id=probe_id,
+                )
+                facts = self.semantic.list_facts(limit=1)
+                self.semantic.delete_node("Fact", probe_id)
+                report["layers"]["semantic"] = "ok"
+                report["layers"]["semantic_backend"] = getattr(self.semantic, "_db_file", "unknown")
+            except Exception as exc:
+                report["layers"]["semantic"] = f"FAILED: {exc}"
+                report["warnings"].append(f"Semantic memory: {exc}")
+                logger.warning("HEALTH CHECK: Semantic memory failed probe: %s", exc)
+
+        # --- Daemon (critical) ---
+        if not hasattr(self, "_daemon"):
+            report["layers"]["daemon"] = "not started"
+            report["critical"].append("MemoryDaemon not started")
+        elif not self._daemon._thread.is_alive():
+            report["layers"]["daemon"] = "DEAD"
+            report["critical"].append("MemoryDaemon thread is not alive")
+        else:
+            report["layers"]["daemon"] = "ok"
+            report["layers"]["daemon_stats"] = self._daemon.get_stats()
+
+        # --- Path validation (warning) ---
+        for name, path in [
+            ("project_dir", self._project_dir),
+            ("working_db", self._project_dir / "working.db"),
+        ]:
+            if not Path(str(path)).is_absolute():
+                msg = f"Path not absolute: {name}={path}"
+                report["warnings"].append(msg)
+                logger.warning("HEALTH CHECK: %s", msg)
+
+        # --- Cognitive layer (warning) ---
+        if hasattr(self, "_daemon"):
+            cog_stats = self._daemon._cognitive.get_stats()
+            if not cog_stats.get("enabled"):
+                report["layers"]["cognitive"] = "disabled"
+            else:
+                report["layers"]["cognitive"] = "ok"
+
+        # --- Raise on critical failures ---
+        if report["critical"]:
+            raise RuntimeError(
+                f"ProjectMemory health check failed for {self.project_id}: "
+                + "; ".join(report["critical"])
+            )
+
+        # Log summary
+        warning_count = len(report["warnings"])
+        if warning_count:
+            logger.warning(
+                "HEALTH CHECK: project=%s passed with %d warning(s): %s",
+                self.project_id, warning_count, "; ".join(report["warnings"])
+            )
+        else:
+            logger.info("HEALTH CHECK: project=%s all layers ok", self.project_id)
+
+        return report

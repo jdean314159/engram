@@ -1,406 +1,218 @@
 """
 Semantic Memory Implementation
 
-Graph database for structured knowledge using Kuzu.
-Supports complex relationships, pattern matching, and traversal queries.
+SQLite-backed structured knowledge store replacing the previous Kuzu
+graph database implementation. Stores facts, preferences, and events
+with FTS5 full-text search and WAL-mode concurrent reads.
 
-Key features:
-- Property graph model (nodes + relationships with properties)
-- Cypher query language
-- 5-50ms query latency
-- Project-specific schemas
-- Multi-hop traversal
+Preserves the full public interface of the Kuzu implementation so no
+changes are required in retrieval.py, ingestion.py, or project_memory.py.
+
+Graph traversal (add_node, add_relationship, query) is stubbed — those
+methods return safely but do nothing. When graph traversal becomes a
+concrete requirement (e.g. language tutor learner model queries), a
+migration path from this flat schema to a proper graph store is
+straightforward since all data is in well-structured SQLite tables.
 
 Author: Jeffrey Dean
 """
 
-import kuzu
+from __future__ import annotations
+
+import hashlib
 import json
-import time
 import logging
+import re
+import sqlite3
 import threading
-from typing import List, Dict, Any, Optional, Tuple
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from enum import Enum
+from typing import Any, Dict, List, Optional
 
-from .semantic_search import SemanticSearchMixin
-from .semantic_schema import init_project_schema
-# ProjectType, Node, Relationship live in types.py (no kuzu dependency)
-# so they can be imported in base environments without kuzu installed.
 from .types import Node, ProjectType, Relationship
+# Re-export ProjectType so existing import sites don't need updating:
+# `from .memory.semantic_memory import ProjectType` continues to work.
+__all__ = ["SemanticMemory", "ProjectType", "Node", "Relationship"]
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Schema DDL
+# ---------------------------------------------------------------------------
 
-class SemanticMemory(SemanticSearchMixin):
+_DDL = """
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA foreign_keys=ON;
+PRAGMA cache_size=-8000;
+
+CREATE TABLE IF NOT EXISTS facts (
+    id          TEXT PRIMARY KEY,
+    content     TEXT NOT NULL,
+    confidence  REAL NOT NULL DEFAULT 0.7,
+    source      TEXT NOT NULL DEFAULT 'conversation',
+    metadata    TEXT NOT NULL DEFAULT '{}',
+    timestamp   REAL NOT NULL,
+    user_id     TEXT NOT NULL DEFAULT 'primary_user'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
+    content,
+    content='facts',
+    content_rowid='rowid',
+    tokenize='unicode61 remove_diacritics 1'
+);
+
+CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+    INSERT INTO facts_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
+    INSERT INTO facts_fts(facts_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
+    INSERT INTO facts_fts(facts_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+    INSERT INTO facts_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+
+CREATE TABLE IF NOT EXISTS preferences (
+    id          TEXT PRIMARY KEY,
+    category    TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    strength    REAL NOT NULL DEFAULT 0.7,
+    source      TEXT NOT NULL DEFAULT 'conversation',
+    timestamp   REAL NOT NULL,
+    user_id     TEXT NOT NULL DEFAULT 'primary_user'
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id          TEXT PRIMARY KEY,
+    summary     TEXT NOT NULL,
+    detail      TEXT NOT NULL DEFAULT '',
+    importance  REAL NOT NULL DEFAULT 0.6,
+    source      TEXT NOT NULL DEFAULT 'lifecycle',
+    metadata    TEXT NOT NULL DEFAULT '{}',
+    timestamp   REAL NOT NULL,
+    user_id     TEXT NOT NULL DEFAULT 'default_user'
+);
+
+CREATE INDEX IF NOT EXISTS facts_timestamp     ON facts(timestamp DESC);
+CREATE INDEX IF NOT EXISTS facts_source        ON facts(source);
+CREATE INDEX IF NOT EXISTS prefs_category      ON preferences(category);
+CREATE INDEX IF NOT EXISTS prefs_timestamp     ON preferences(timestamp DESC);
+CREATE INDEX IF NOT EXISTS events_timestamp    ON events(timestamp DESC);
+CREATE INDEX IF NOT EXISTS events_importance   ON events(importance DESC);
+"""
+
+
+def _stable_id(prefix: str, *parts: str) -> str:
+    key = ":".join(parts)
+    return f"{prefix}_{hashlib.sha256(key.encode()).hexdigest()[:16]}"
+
+
+def _tokenize(text: str) -> set:
+    raw = re.findall(r"[A-Za-z0-9_./-]+", (text or "").lower())
+    out: set = set()
+    for tok in raw:
+        if len(tok) > 2:
+            out.add(tok)
+    return out
+
+
+def _lexical_overlap(query_terms: set, text: str) -> float:
+    if not query_terms:
+        return 0.0
+    text_terms = _tokenize(text)
+    if not text_terms:
+        return 0.0
+    return len(query_terms & text_terms) / max(1, len(query_terms))
+
+
+class SemanticMemory:
+    """SQLite-backed semantic memory store.
+
+    Replaces the Kuzu graph database with a simpler, more robust
+    implementation using SQLite WAL mode and FTS5 full-text search.
+
+    Thread safety: all writes are serialized via a threading.RLock.
+    Reads use a separate connection per thread via threading.local
+    to allow concurrent reads under WAL mode without blocking writers.
+
+    Args:
+        db_path:      Path to SQLite database file, or directory (creates
+                      semantic.db inside). None = in-memory (testing).
+        project_type: Accepted for interface compatibility; no effect.
     """
-    Kuzu graph database for semantic knowledge.
-    
-    Stores structured facts, preferences, and relationships.
-    Supports Cypher queries for pattern matching and traversal.
-    
-    Usage:
-        memory = SemanticMemory(
-            db_path="./data/semantic",
-            project_type=ProjectType.PROGRAMMING_ASSISTANT
-        )
-        
-        # Add nodes
-        memory.add_node("Concept", "async_python", {
-            "name": "Async Python",
-            "difficulty": "intermediate",
-            "documentation": "https://..."
-        })
-        
-        # Add relationships
-        memory.add_relationship(
-            "Concept", "async_python",
-            "Concept", "event_loops",
-            "REQUIRES"
-        )
-        
-        # Query
-        results = memory.query('''
-            MATCH (c:Concept)-[:REQUIRES*1..3]->(prereq)
-            WHERE c.name = 'Async Python'
-            RETURN prereq.name, prereq.difficulty
-        ''')
-    """
-    
+
     def __init__(
         self,
         db_path: Optional[Path] = None,
         project_type: Optional[ProjectType] = None,
-        buffer_pool_size: int = 256 * 1024 * 1024,  # 256MB
+        **kwargs,  # absorb buffer_pool_size etc. from old call sites
     ):
-        """
-        Initialize semantic memory.
-        
-        Args:
-            db_path: Path to Kuzu database directory. None = in-memory (testing)
-            project_type: Project type for schema initialization
-            buffer_pool_size: Memory buffer for Kuzu (bytes)
-        """
         self.db_path = db_path
         self.project_type = project_type
 
-        # Initialize Kuzu database.
-        # Newer Kuzu versions (0.6+) default to mmap-ing very large virtual
-        # address regions on 64-bit Linux.  We pass an explicit buffer_pool_size
-        # and fall back to progressively smaller values if the OS cannot
-        # satisfy the mmap request (seen as "Buffer manager exception: Mmap
-        # for size ... failed").
-        _pool_sizes = [buffer_pool_size, 64 * 1024 * 1024, 16 * 1024 * 1024]
-        _last_err = None
-        if db_path:
-            db_path = Path(db_path)
-            for _pool in _pool_sizes:
-                try:
-                    self.db = kuzu.Database(str(db_path), buffer_pool_size=_pool)
-                    break
-                except Exception as e:
-                    _last_err = e
-                    logger.debug("kuzu.Database(pool=%d) failed: %s", _pool, e)
-            else:
-                raise RuntimeError(
-                    f"Kuzu failed to open database at {db_path} "
-                    f"with all buffer_pool_size fallbacks: {_last_err}"
-                )
+        # Resolve database file path
+        if db_path is None:
+            self._db_file = ":memory:"
         else:
-            for _pool in _pool_sizes:
-                try:
-                    self.db = kuzu.Database(buffer_pool_size=_pool)
-                    break
-                except Exception as e:
-                    _last_err = e
+            db_path = Path(db_path).expanduser().resolve(strict=False)
+            if db_path.suffix in (".db", ".sqlite", ".sqlite3"):
+                self._db_file = str(db_path)
+                db_path.parent.mkdir(parents=True, exist_ok=True)
             else:
-                raise RuntimeError(
-                    f"Kuzu in-memory database failed: {_last_err}"
-                )
-        
-        self.conn = kuzu.Connection(self.db)
+                # Treat as directory (legacy: old code passed a dir for Kuzu)
+                db_path.mkdir(parents=True, exist_ok=True)
+                self._db_file = str(db_path / "semantic.db")
+
         self._lock = threading.RLock()
-        
-        # Track created tables
-        self.node_tables = set()
-        self.rel_tables = set()
-        
-        # Initialize core schema
-        self._init_core_schema()
-        
-        # Initialize project-specific schema if provided
-        if project_type:
-            self._init_project_schema(project_type)
-    
-    def _init_core_schema(self):
-        """Initialize core schema used by all projects."""
-        
-        # User node
-        self._create_node_table_safe("User", [
-            ("id", "STRING"),
-            ("name", "STRING"),
-            ("created", "DOUBLE"),
-            ("metadata", "STRING"),  # JSON
-        ], "id")
-        
-        # Fact node (general knowledge)
-        self._create_node_table_safe("Fact", [
-            ("id", "STRING"),
-            ("content", "STRING"),
-            ("timestamp", "DOUBLE"),
-            ("confidence", "DOUBLE"),  # 0.0-1.0
-            ("source", "STRING"),
-            ("metadata", "STRING"),  # JSON
-        ], "id")
-        
-        # Preference node
-        self._create_node_table_safe("Preference", [
-            ("id", "STRING"),
-            ("category", "STRING"),
-            ("value", "STRING"),
-            ("strength", "DOUBLE"),  # 0.0-1.0
-            ("timestamp", "DOUBLE"),
-        ], "id")
+        self._local = threading.local()
 
-        # Generic event node used by the memory runtime itself.
-        # This intentionally carries fields needed by both generic assistant
-        # memory and the file-organizer overlay so retrieval does not depend on
-        # project-specific table variants.
-        self._create_node_table_safe("Event", [
-            ("id", "STRING"),
-            ("summary", "STRING"),
-            ("detail", "STRING"),
-            ("timestamp", "DOUBLE"),
-            ("importance", "DOUBLE"),
-            ("source", "STRING"),
-            ("metadata", "STRING"),
-            ("name", "STRING"),
-            ("start_time", "DOUBLE"),
-            ("end_time", "DOUBLE"),
-            ("location_id", "STRING"),
-            ("description", "STRING"),
-        ], "id")
-        
-        # Core relationships
-        self._create_rel_table_safe("HAS_FACT", "User", "Fact", [
-            ("created", "DOUBLE"),
-        ])
-        
-        self._create_rel_table_safe("HAS_PREFERENCE", "User", "Preference", [
-            ("created", "DOUBLE"),
-        ])
-        
-        self._create_rel_table_safe("RELATES_TO", "Fact", "Fact", [
-            ("relation_type", "STRING"),
-            ("strength", "DOUBLE"),
-        ])
+        # Writer connection (single, serialized)
+        self._write_conn = self._open_connection()
+        self._apply_schema(self._write_conn)
 
-        self._create_rel_table_safe("HAS_EVENT", "User", "Event", [
-            ("created", "DOUBLE"),
-        ])
+        # Compatibility attributes expected by tests / legacy callers
+        self.node_tables: set = {"Fact", "Preference", "Event", "User"}
+        self.rel_tables: set = set()
 
-        self._create_rel_table_safe("DERIVED_FROM", "Event", "Fact", [
-            ("created", "DOUBLE"),
-        ])
+        logger.info("SemanticMemory (SQLite) initialized at %s", self._db_file)
 
-        # --- Typed relation edges (populated by TypedRelationExtractor) ---
-        # These connect User context nodes to Entity/Fact/Preference nodes
-        # extracted from conversation text. Unlike CO_OCCURS (entity↔entity
-        # statistical), these carry semantic meaning usable at query time.
+    # ------------------------------------------------------------------
+    # Connection management
+    # ------------------------------------------------------------------
 
-        # User PREFERS something (e.g. "I prefer pytest over unittest")
-        self._create_rel_table_safe("PREFERS", "Preference", "Entity", [
-            ("confidence",   "DOUBLE"),
-            ("source_text",  "STRING"),
-            ("timestamp",    "DOUBLE"),
-        ])
-
-        # User USES a tool/technology (e.g. "I use PyCharm")
-        self._create_rel_table_safe("USES", "Fact", "Entity", [
-            ("confidence",   "DOUBLE"),
-            ("source_text",  "STRING"),
-            ("timestamp",    "DOUBLE"),
-        ])
-
-        # Fact KNOWS_ABOUT an entity (e.g. "User works at Anthropic")
-        self._create_rel_table_safe("KNOWS_ABOUT", "Fact", "Entity", [
-            ("confidence",   "DOUBLE"),
-            ("source_text",  "STRING"),
-            ("timestamp",    "DOUBLE"),
-        ])
-    
-    def _init_project_schema(self, project_type: "ProjectType"):
-        """Initialize project-specific schema (delegates to semantic_schema)."""
-        init_project_schema(self, project_type)
-
-    def _create_node_table_safe(
-        self,
-        table_name: str,
-        properties: List[Tuple[str, str]],
-        primary_key: str
-    ):
-        """Create node table if it doesn't exist."""
-        if table_name in self.node_tables:
-            return
-        
-        props_sql = ", ".join([f"{name} {type_}" for name, type_ in properties])
-        sql = f"CREATE NODE TABLE IF NOT EXISTS {table_name}({props_sql}, PRIMARY KEY({primary_key}))"
-        
-        try:
-            self.conn.execute(sql)
-            self.node_tables.add(table_name)
-        except Exception as e:
-            logger.debug("Node table %s: %s", table_name, e)
-            self.node_tables.add(table_name)  # Assume exists
-    
-    def _create_rel_table_safe(
-        self,
-        rel_name: str,
-        from_table: str,
-        to_table: str,
-        properties: List[Tuple[str, str]] = None
-    ):
-        """Create relationship table if it doesn't exist.
-
-        Does NOT cache failures caused by missing node tables — those can be
-        retried once the node tables exist.  Only caches success or definitive
-        "already exists" responses so GraphExtractor can force a retry.
-        """
-        rel_key = f"{rel_name}_{from_table}_{to_table}"
-        if rel_key in self.rel_tables:
-            return
-
-        props_sql = ""
-        if properties:
-            props_sql = ", " + ", ".join([f"{name} {type_}" for name, type_ in properties])
-
-        sql = f"CREATE REL TABLE IF NOT EXISTS {rel_name}(FROM {from_table} TO {to_table}{props_sql})"
-
-        try:
-            self.conn.execute(sql)
-            self.rel_tables.add(rel_key)
-        except Exception as e:
-            err_str = str(e).lower()
-            if "already exist" in err_str or "already defined" in err_str:
-                # Table already exists — safe to cache
-                self.rel_tables.add(rel_key)
-            else:
-                # Real failure (e.g. node table doesn't exist yet) — do NOT cache.
-                # GraphExtractor._ensure_schema will retry after creating node tables.
-                logger.debug("Rel table %s creation deferred: %s", rel_key, e)
-    
-    def add_node(
-        self,
-        table: str,
-        node_id: str,
-        properties: Dict[str, Any]
-    ) -> Node:
-        """
-        Add node to graph.
-        
-        Args:
-            table: Node table name
-            node_id: Unique node ID
-            properties: Node properties dict
-            
-        Returns:
-            Node object
-        """
-        with self._lock:
-            # Build property map
-            props_str = ", ".join([f"{k}: ${k}" for k in properties.keys()])
-            sql = f"CREATE (n:{table} {{id: $id, {props_str}}})"
-            
-            params = {"id": node_id}
-            params.update(properties)
-            
-            try:
-                self.conn.execute(sql, params)
-            except Exception as e:
-                # Node might already exist, try update
-                set_str = ", ".join([f"n.{k} = ${k}" for k in properties.keys()])
-                update_sql = f"MATCH (n:{table}) WHERE n.id = $id SET {set_str}"
-                self.conn.execute(update_sql, params)
-        
-        return Node(table=table, id=node_id, properties=properties)
-    
-    def add_relationship(
-        self,
-        from_table: str,
-        from_id: str,
-        to_table: str,
-        to_id: str,
-        rel_type: str,
-        properties: Optional[Dict[str, Any]] = None
-    ) -> Relationship:
-        """
-        Add relationship between nodes.
-        
-        Args:
-            from_table: Source node table
-            from_id: Source node ID
-            to_table: Target node table
-            to_id: Target node ID
-            rel_type: Relationship type
-            properties: Optional relationship properties
-            
-        Returns:
-            Relationship object
-        """
-        props = properties or {}
-        
-        with self._lock:
-            if props:
-                prop_str = ", ".join([f"{k}: ${k}" for k in props.keys()])
-                sql = f"""
-                    MATCH (a:{from_table}), (b:{to_table})
-                    WHERE a.id = $from_id AND b.id = $to_id
-                    CREATE (a)-[:{rel_type} {{{prop_str}}}]->(b)
-                """
-                params = {"from_id": from_id, "to_id": to_id}
-                params.update(props)
-            else:
-                sql = f"""
-                    MATCH (a:{from_table}), (b:{to_table})
-                    WHERE a.id = $from_id AND b.id = $to_id
-                    CREATE (a)-[:{rel_type}]->(b)
-                """
-                params = {"from_id": from_id, "to_id": to_id}
-            
-            self.conn.execute(sql, params)
-        
-        return Relationship(
-            rel_type=rel_type,
-            from_id=from_id,
-            to_id=to_id,
-            properties=props
+    def _open_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            self._db_file,
+            check_same_thread=False,
+            timeout=10.0,
         )
-    
-    def query(self, cypher: str, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """
-        Execute Cypher query.
-        
-        Args:
-            cypher: Cypher query string
-            parameters: Optional query parameters
-            
-        Returns:
-            List of result dicts
-        """
-        params = parameters or {}
-        
-        with self._lock:
-            result = self.conn.execute(cypher, params)
-            
-            # Convert to list of dicts
-            rows = []
-            while result.has_next():
-                row = result.get_next()
-                rows.append(dict(zip(result.get_column_names(), row)))
-        
-        return rows
-    
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("PRAGMA cache_size=-8000;")
+        return conn
+
+    def _apply_schema(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(_DDL)
+        conn.commit()
+
+    def _reader(self) -> sqlite3.Connection:
+        """Return a per-thread read connection."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._open_connection()
+            self._local.conn = conn
+        return conn
+
+    # ------------------------------------------------------------------
+    # Facts
+    # ------------------------------------------------------------------
 
     def add_fact(
         self,
@@ -411,27 +223,61 @@ class SemanticMemory(SemanticSearchMixin):
         user_id: str = "primary_user",
         fact_id: Optional[str] = None,
     ) -> Node:
-        """Add a generic fact and link it to the default user node."""
-        if not fact_id:
-            import hashlib
-            fact_id = "fact_" + hashlib.sha256(content.encode()).hexdigest()[:16]
-        self.add_node("User", user_id, {
-            "name": user_id,
-            "created": time.time(),
-            "metadata": json.dumps({}),
-        })
-        node = self.add_node("Fact", fact_id, {
-            "content": content,
-            "timestamp": time.time(),
-            "confidence": confidence,
-            "source": source,
-            "metadata": json.dumps(metadata or {}),
-        })
+        """Add or update a fact. Returns a Node for interface compatibility."""
+        fid = fact_id or _stable_id("fact", content)
+        meta = json.dumps(metadata or {})
+        ts = time.time()
+
+        with self._lock:
+            self._write_conn.execute(
+                """
+                INSERT INTO facts (id, content, confidence, source, metadata, timestamp, user_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    content    = excluded.content,
+                    confidence = excluded.confidence,
+                    source     = excluded.source,
+                    metadata   = excluded.metadata,
+                    timestamp  = excluded.timestamp
+                """,
+                (fid, content, confidence, source, meta, ts, user_id),
+            )
+            self._write_conn.commit()
+
+        return Node(
+            table="Fact",
+            id=fid,
+            properties={"content": content, "confidence": confidence,
+                        "source": source, "metadata": metadata or {},
+                        "timestamp": ts},
+        )
+
+    def list_facts(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Return facts ordered by timestamp descending."""
         try:
-            self.add_relationship("User", user_id, "Fact", fact_id, "HAS_FACT", {"created": time.time()})
-        except Exception:
-            pass
-        return node
+            cur = self._reader().execute(
+                "SELECT id, content, confidence, source, metadata, timestamp "
+                "FROM facts ORDER BY timestamp DESC LIMIT ?",
+                (int(limit),),
+            )
+            rows = []
+            for r in cur.fetchall():
+                rows.append({
+                    "id": r["id"],
+                    "content": r["content"],
+                    "confidence": r["confidence"],
+                    "source": r["source"],
+                    "metadata": json.loads(r["metadata"] or "{}"),
+                    "timestamp": r["timestamp"],
+                })
+            return rows
+        except Exception as exc:
+            logger.warning("list_facts failed: %s", exc)
+            return []
+
+    # ------------------------------------------------------------------
+    # Preferences
+    # ------------------------------------------------------------------
 
     def add_preference(
         self,
@@ -442,34 +288,75 @@ class SemanticMemory(SemanticSearchMixin):
         user_id: str = "primary_user",
         preference_id: Optional[str] = None,
     ) -> Node:
-        """Add a generic preference and link it to the default user node."""
-        if not preference_id:
-            import hashlib
-            preference_id = "pref_" + hashlib.sha256(f"{category}:{value}".encode()).hexdigest()[:16]
-        self.add_node("User", user_id, {
-            "name": user_id,
-            "created": time.time(),
-            "metadata": json.dumps({"source": source}),
-        })
-        node = self.add_node("Preference", preference_id, {
-            "category": category,
-            "value": value,
-            "strength": strength,
-            "timestamp": time.time(),
-        })
-        try:
-            self.add_relationship("User", user_id, "Preference", preference_id, "HAS_PREFERENCE", {"created": time.time()})
-        except Exception:
-            pass
-        return node
+        """Add or update a preference. Returns a Node for interface compatibility."""
+        pid = preference_id or _stable_id("pref", category, value)
+        ts = time.time()
 
-    def _ensure_default_user(self, user_id: str = "primary_user") -> None:
-        """Upsert the User node so relationship targets always exist."""
-        self.add_node("User", user_id, {
-            "name": user_id,
-            "created": time.time(),
-            "metadata": json.dumps({}),
-        })
+        with self._lock:
+            self._write_conn.execute(
+                """
+                INSERT INTO preferences (id, category, value, strength, source, timestamp, user_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    strength  = excluded.strength,
+                    source    = excluded.source,
+                    timestamp = excluded.timestamp
+                """,
+                (pid, category, value, strength, source, ts, user_id),
+            )
+            self._write_conn.commit()
+
+        return Node(
+            table="Preference",
+            id=pid,
+            properties={"category": category, "value": value,
+                        "strength": strength, "source": source,
+                        "timestamp": ts},
+        )
+
+    def list_preferences(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Return preferences ordered by timestamp descending."""
+        try:
+            cur = self._reader().execute(
+                "SELECT id, category, value, strength, source, timestamp "
+                "FROM preferences ORDER BY timestamp DESC LIMIT ?",
+                (int(limit),),
+            )
+            rows = []
+            for r in cur.fetchall():
+                rows.append({
+                    "id": r["id"],
+                    "category": r["category"],
+                    "value": r["value"],
+                    "strength": r["strength"],
+                    "source": r["source"],
+                    "timestamp": r["timestamp"],
+                })
+            return rows
+        except Exception as exc:
+            logger.warning("list_preferences failed: %s", exc)
+            return []
+
+    def search_preferences(
+        self,
+        query: str,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Search preferences by lexical overlap on category and value."""
+        query_terms = _tokenize(query)
+        rows = self.list_preferences(limit=100)
+        scored = []
+        for row in rows:
+            text = f"{row['category']} {row['value']}"
+            score = _lexical_overlap(query_terms, text)
+            row["match_score"] = round(score, 4)
+            scored.append(row)
+        scored.sort(key=lambda r: r["match_score"], reverse=True)
+        return scored[:limit]
+
+    # ------------------------------------------------------------------
+    # Events
+    # ------------------------------------------------------------------
 
     def add_event(
         self,
@@ -482,115 +369,369 @@ class SemanticMemory(SemanticSearchMixin):
         user_id: str = "default_user",
         event_id: Optional[str] = None,
     ) -> Node:
-        """Add a generic event node.
+        """Add an event. Returns a Node for interface compatibility."""
+        eid = event_id or f"event_{int(time.time() * 1_000_000)}"
+        meta = json.dumps(metadata or {})
+        ts = time.time()
 
-        Events are the generic bridge between raw episodes and durable semantic
-        memory. They avoid forcing every project into a domain-specific schema.
-        """
-        event_id = event_id or f"event_{int(time.time() * 1000000)}"
-        self._ensure_default_user(user_id)
-        payload = {
-            "summary": summary,
-            "detail": detail,
-            "timestamp": time.time(),
-            "importance": importance,
-            "source": source,
-            "metadata": json.dumps(metadata or {}),
-        }
-        node = self.add_node("Event", event_id, payload)
-        try:
-            self.add_relationship("User", user_id, "Event", event_id, "HAS_EVENT", {"created": time.time()})
-        except Exception:
-            pass
-        return node
+        with self._lock:
+            self._write_conn.execute(
+                """
+                INSERT INTO events (id, summary, detail, importance, source, metadata, timestamp, user_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    summary    = excluded.summary,
+                    detail     = excluded.detail,
+                    importance = excluded.importance,
+                    source     = excluded.source,
+                    metadata   = excluded.metadata,
+                    timestamp  = excluded.timestamp
+                """,
+                (eid, summary, detail, importance, source, meta, ts, user_id),
+            )
+            self._write_conn.commit()
+
+        return Node(
+            table="Event",
+            id=eid,
+            properties={"summary": summary, "detail": detail,
+                        "importance": importance, "source": source,
+                        "metadata": metadata or {}, "timestamp": ts},
+        )
 
     def list_events(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """Return generic events for retrieval and lifecycle inspection."""
+        """Return events ordered by timestamp descending."""
         try:
-            return self.query(
-                f"MATCH (e:Event) RETURN e.id as id, e.summary as summary, e.detail as detail, e.timestamp as timestamp, e.importance as importance, e.source as source, e.metadata as metadata LIMIT {int(limit)}"
+            cur = self._reader().execute(
+                "SELECT id, summary, detail, importance, source, metadata, timestamp "
+                "FROM events ORDER BY timestamp DESC LIMIT ?",
+                (int(limit),),
             )
-        except Exception:
+            rows = []
+            for r in cur.fetchall():
+                rows.append({
+                    "id": r["id"],
+                    "summary": r["summary"],
+                    "detail": r["detail"],
+                    "importance": r["importance"],
+                    "source": r["source"],
+                    "metadata": json.loads(r["metadata"] or "{}"),
+                    "timestamp": r["timestamp"],
+                })
+            return rows
+        except Exception as exc:
+            logger.warning("list_events failed: %s", exc)
             return []
 
-    def list_facts(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """Return generic facts for application-side scoring."""
-        try:
-            return self.query(f"MATCH (f:Fact) RETURN f.id as id, f.content as content, f.timestamp as timestamp, f.confidence as confidence, f.source as source, f.metadata as metadata LIMIT {int(limit)}")
-        except Exception:
-            return []
+    # ------------------------------------------------------------------
+    # Unified search (SemanticLayerProtocol)
+    # ------------------------------------------------------------------
 
-    def list_preferences(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """Return generic preferences for application-side scoring."""
+    def search_generic_memories(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        per_type_limit: int = 60,
+        include_graph: bool = True,
+        graph_sentence_limit: int = 6,
+    ) -> List[Dict[str, Any]]:
+        """Return scored semantic rows matching query.
+
+        Satisfies SemanticLayerProtocol so UnifiedRetriever can use the
+        preferred code path without falling back to generic_memory_rows.
+
+        Scoring:
+        - Facts: FTS5 BM25 rank (if match) + lexical overlap
+        - Preferences: lexical overlap on category + value
+        - Events: lexical overlap on summary
+        All rows include a normalised match_score in [0, 1].
+        """
+        results: List[Dict[str, Any]] = []
+        query_terms = _tokenize(query)
+        now = time.time()
+
+        # --- Facts (FTS5) ---
         try:
-            return self.query(f"MATCH (p:Preference) RETURN p.id as id, p.category as category, p.value as value, p.strength as strength, p.timestamp as timestamp LIMIT {int(limit)}")
-        except Exception:
-            return []
+            # FTS5 rank: negative, more negative = better match
+            fts_rows = self._reader().execute(
+                """
+                SELECT f.id, f.content, f.confidence, f.source,
+                       f.metadata, f.timestamp,
+                       bm25(facts_fts) AS bm25_rank
+                FROM facts_fts
+                JOIN facts f ON facts_fts.rowid = f.rowid
+                WHERE facts_fts MATCH ?
+                ORDER BY bm25_rank
+                LIMIT ?
+                """,
+                (self._fts_query(query), per_type_limit),
+            ).fetchall()
+
+            # Normalise BM25: convert negative rank to [0,1]
+            bm25_vals = [abs(r["bm25_rank"]) for r in fts_rows] or [1.0]
+            bm25_max = max(bm25_vals) or 1.0
+
+            for r in fts_rows:
+                lexical = _lexical_overlap(query_terms, r["content"])
+                bm25_norm = abs(r["bm25_rank"]) / bm25_max
+                match_score = min(1.0, 0.6 * bm25_norm + 0.4 * lexical)
+                results.append({
+                    "type": "fact",
+                    "id": r["id"],
+                    "content": r["content"],
+                    "confidence": r["confidence"],
+                    "source": r["source"],
+                    "metadata": json.loads(r["metadata"] or "{}"),
+                    "timestamp": r["timestamp"],
+                    "match_score": round(match_score, 4),
+                })
+        except Exception as exc:
+            logger.debug("FTS search failed, falling back: %s", exc)
+            # Fallback: plain lexical scan
+            for row in self.list_facts(limit=per_type_limit):
+                score = _lexical_overlap(query_terms, row["content"])
+                if score > 0:
+                    row["type"] = "fact"
+                    row["match_score"] = round(score, 4)
+                    results.append(row)
+
+        # --- Preferences (lexical) ---
+        try:
+            for row in self.list_preferences(limit=per_type_limit):
+                text = f"{row['category']} {row['value']}"
+                score = _lexical_overlap(query_terms, text)
+                row["type"] = "preference"
+                row["match_score"] = round(score, 4)
+                results.append(row)
+        except Exception as exc:
+            logger.debug("Preference search failed: %s", exc)
+
+        # --- Events (lexical) ---
+        try:
+            for row in self.list_events(limit=per_type_limit):
+                text = f"{row['summary']} {row['detail']}"
+                score = _lexical_overlap(query_terms, text)
+                row["type"] = "event"
+                row["match_score"] = round(score, 4)
+                results.append(row)
+        except Exception as exc:
+            logger.debug("Event search failed: %s", exc)
+
+        # Sort by match_score descending, cap at limit
+        results.sort(key=lambda r: r["match_score"], reverse=True)
+        return results[:limit]
+
+    def _fts_query(self, query: str) -> str:
+        """Convert a natural language query to an FTS5 match expression.
+
+        Strips punctuation that would cause FTS5 parse errors, then
+        wraps each token in double-quotes to force exact-token matching
+        rather than prefix matching.  Falls back to a simple phrase if
+        quoting fails.
+        """
+        tokens = re.findall(r"[A-Za-z0-9_]+", query)
+        if not tokens:
+            return '""'
+        return " OR ".join(f'"{tok}"' for tok in tokens if len(tok) > 1)
+
+    # ------------------------------------------------------------------
+    # Generic rows (legacy fallback path in retrieval.py)
+    # ------------------------------------------------------------------
 
     def generic_memory_rows(self, limit_per_type: int = 100) -> List[Dict[str, Any]]:
-        """Return generic semantic rows independent of domain-specific schema."""
+        """Return all rows from all tables — legacy fallback."""
         rows: List[Dict[str, Any]] = []
-        rows.extend({"type": "fact", **row} for row in self.list_facts(limit=limit_per_type))
-        rows.extend({"type": "preference", **row} for row in self.list_preferences(limit=limit_per_type))
-        rows.extend({"type": "event", **row} for row in self.list_events(limit=limit_per_type))
+        rows.extend({"type": "fact", **r} for r in self.list_facts(limit=limit_per_type))
+        rows.extend({"type": "preference", **r} for r in self.list_preferences(limit=limit_per_type))
+        rows.extend({"type": "event", **r} for r in self.list_events(limit=limit_per_type))
         return rows
 
+    # ------------------------------------------------------------------
+    # Graph stubs (interface compatibility)
+    # ------------------------------------------------------------------
+
+    def add_node(
+        self,
+        table: str,
+        node_id: str,
+        properties: Dict[str, Any],
+    ) -> Node:
+        """Graph stub — routes Fact/Preference/Event to their SQL methods.
+
+        Other node types (Entity, Concept, etc.) are silently ignored until
+        graph traversal becomes a concrete requirement.
+        """
+        t = table.lower()
+        if t == "fact":
+            content = properties.get("content", "")
+            return self.add_fact(
+                content=content,
+                confidence=float(properties.get("confidence", 0.7)),
+                source=str(properties.get("source", "conversation")),
+                metadata=properties.get("metadata") if isinstance(properties.get("metadata"), dict) else None,
+                fact_id=node_id,
+            )
+        if t == "preference":
+            return self.add_preference(
+                category=str(properties.get("category", "general")),
+                value=str(properties.get("value", "")),
+                strength=float(properties.get("strength", 0.7)),
+                preference_id=node_id,
+            )
+        if t == "event":
+            return self.add_event(
+                summary=str(properties.get("summary", "")),
+                detail=str(properties.get("detail", "")),
+                importance=float(properties.get("importance", 0.6)),
+                source=str(properties.get("source", "lifecycle")),
+                event_id=node_id,
+            )
+        # Unknown table type (Entity, Concept, etc.) — no-op
+        logger.debug("add_node: ignoring unsupported table type %r", table)
+        return Node(table=table, id=node_id, properties=properties)
+
+    def add_relationship(
+        self,
+        from_table: str,
+        from_id: str,
+        to_table: str,
+        to_id: str,
+        rel_type: str,
+        properties: Optional[Dict[str, Any]] = None,
+    ) -> Relationship:
+        """Graph stub — no-op. Relationships are not stored in the SQLite backend."""
+        logger.debug(
+            "add_relationship: %s(%s)-[%s]->%s(%s) not stored (SQLite backend)",
+            from_table, from_id, rel_type, to_table, to_id,
+        )
+        return Relationship(
+            rel_type=rel_type,
+            from_id=from_id,
+            to_id=to_id,
+            properties=properties or {},
+        )
+
+    def query(
+        self,
+        cypher: str,
+        parameters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Graph stub — Cypher queries are not supported in the SQLite backend.
+
+        Returns an empty list. Code that calls this for graph traversal
+        will silently get no results. This is intentional — graph traversal
+        is not yet a concrete requirement and will be implemented when needed.
+        """
+        logger.debug("query(): Cypher not supported in SQLite backend — returning []")
+        return []
 
     def get_node(self, table: str, node_id: str) -> Optional[Node]:
-        """Retrieve node by ID."""
-        sql = f"MATCH (n:{table}) WHERE n.id = $id RETURN n"
-        results = self.query(sql, {"id": node_id})
-        
-        if not results:
-            return None
-        
-        node_data = results[0]["n"]
-        return Node(table=table, id=node_id, properties=node_data)
-    
-    def delete_node(self, table: str, node_id: str):
-        """Delete node and its relationships."""
-        with self._lock:
-            sql = f"MATCH (n:{table}) WHERE n.id = $id DETACH DELETE n"
-            self.conn.execute(sql, {"id": node_id})
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get database statistics."""
-        stats = {
-            "node_tables": list(self.node_tables),
-            "rel_tables": list(self.rel_tables),
-            "node_counts": {},
-            "rel_counts": {},
-        }
-        
-        # Count nodes per table
-        for table in self.node_tables:
-            try:
-                result = self.query(f"MATCH (n:{table}) RETURN count(n) as count")
-                stats["node_counts"][table] = result[0]["count"] if result else 0
-            except Exception as e:
-                logger.debug("Stats query failed for %s: %s", table, e)
-                stats["node_counts"][table] = 0
-        
-        return stats
-    
-    def close(self):
-        """Close the Kuzu database connection to release file handles."""
+        """Retrieve a node by ID from the appropriate table."""
+        t = table.lower()
         try:
-            if hasattr(self, "conn") and self.conn is not None:
-                del self.conn
-                self.conn = None
+            if t == "fact":
+                cur = self._reader().execute(
+                    "SELECT * FROM facts WHERE id = ?", (node_id,)
+                )
+                r = cur.fetchone()
+                if r:
+                    return Node(table=table, id=node_id,
+                                properties=dict(r))
+            elif t == "preference":
+                cur = self._reader().execute(
+                    "SELECT * FROM preferences WHERE id = ?", (node_id,)
+                )
+                r = cur.fetchone()
+                if r:
+                    return Node(table=table, id=node_id,
+                                properties=dict(r))
+            elif t == "event":
+                cur = self._reader().execute(
+                    "SELECT * FROM events WHERE id = ?", (node_id,)
+                )
+                r = cur.fetchone()
+                if r:
+                    return Node(table=table, id=node_id,
+                                properties=dict(r))
+        except Exception as exc:
+            logger.debug("get_node(%s, %s) failed: %s", table, node_id, exc)
+        return None
+
+    def delete_node(self, table: str, node_id: str) -> None:
+        """Delete a node from the appropriate table."""
+        t = table.lower()
+        table_map = {"fact": "facts", "preference": "preferences", "event": "events"}
+        sql_table = table_map.get(t)
+        if sql_table is None:
+            logger.debug("delete_node: unsupported table %r", table)
+            return
+        with self._lock:
+            self._write_conn.execute(
+                f"DELETE FROM {sql_table} WHERE id = ?", (node_id,)
+            )
+            self._write_conn.commit()
+
+    # ------------------------------------------------------------------
+    # Compat stubs expected by tests / project_memory.py
+    # ------------------------------------------------------------------
+
+    def _create_node_table_safe(self, *args, **kwargs) -> None:
+        """No-op — schema is fixed at init time."""
+
+    def _create_rel_table_safe(self, *args, **kwargs) -> None:
+        """No-op — relationships are not stored."""
+
+    def _ensure_default_user(self, user_id: str = "primary_user") -> None:
+        """No-op — User table not present in SQLite backend."""
+
+    # ------------------------------------------------------------------
+    # Stats & lifecycle
+    # ------------------------------------------------------------------
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Return row counts and storage info."""
+        stats: Dict[str, Any] = {
+            "backend": "sqlite",
+            "db_file": self._db_file,
+            "node_tables": list(self.node_tables),
+            "node_counts": {},
+        }
+        try:
+            conn = self._reader()
+            for table, sql_table in (
+                ("Fact", "facts"),
+                ("Preference", "preferences"),
+                ("Event", "events"),
+            ):
+                cur = conn.execute(f"SELECT COUNT(*) FROM {sql_table}")
+                stats["node_counts"][table] = cur.fetchone()[0]
+        except Exception as exc:
+            logger.debug("get_stats failed: %s", exc)
+        return stats
+
+    def close(self) -> None:
+        """Close database connections."""
+        try:
+            with self._lock:
+                if self._write_conn:
+                    self._write_conn.close()
+                    self._write_conn = None
         except Exception:
             pass
         try:
-            if hasattr(self, "db") and self.db is not None:
-                del self.db
-                self.db = None
+            local_conn = getattr(self._local, "conn", None)
+            if local_conn:
+                local_conn.close()
+                self._local.conn = None
         except Exception:
             pass
 
     def __del__(self):
-        """Ensure connection is closed when object is garbage collected."""
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __enter__(self):
         return self

@@ -495,7 +495,7 @@ class SurpriseFilter:
             "momentum": self.momentum,
         }
         
-        path = Path(path)
+        path = Path(path).expanduser().resolve(strict=False)
         path.parent.mkdir(parents=True, exist_ok=True)
         
         with open(path, 'w') as f:
@@ -505,7 +505,7 @@ class SurpriseFilter:
     
     def load_calibration(self, path: Path):
         """Load calibration baseline from file."""
-        path = Path(path)
+        path = Path(path).expanduser().resolve(strict=False)
         
         if not path.exists():
             raise FileNotFoundError(f"Calibration file not found: {path}")
